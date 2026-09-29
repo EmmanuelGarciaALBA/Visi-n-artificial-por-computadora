@@ -1,0 +1,9 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+opencv-python>=4.9
+numpy>=1.26
+asyncua>=1.1
+# Detección de personas/objetos y zonas de seguridad (instala PyTorch CPU, ~250 MB)
+ultralytics>=8.3
+# Lectura de QR, DataMatrix y códigos de barras
+zxing-cpp>=3.0

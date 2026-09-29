@@ -1,0 +1,131 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8090
+  },
+  "camera": {
+    "type": "url",
+    "source": "rtsp://192.168.1.37:554/stream1",
+    "user": "Alfonso",
+    "password": "",
+    "width": 1280,
+    "height": 720
+  },
+  "trigger": {
+    "mode": "continuous",
+    "interval_ms": 150
+  },
+  "inspection": {
+    "running": false
+  },
+  "active_recipe": "r1",
+  "recipes": [
+    {
+      "id": "r1",
+      "number": 1,
+      "name": "Principal",
+      "tools": [
+        {
+          "id": "tmubjdaxe",
+          "name": "Herramienta3",
+          "type": "code_reader",
+          "enabled": true,
+          "roi": [
+            1337,
+            380,
+            555,
+            553
+          ],
+          "params": {
+            "symbology": "qr",
+            "expected": ""
+          },
+          "min": 1,
+          "max": 1
+        }
+      ]
+    }
+  ],
+  "safety": {
+    "enabled": false,
+    "fps": 5,
+    "conf": 0.5,
+    "model": "yolo11n.pt",
+    "mode": "caja",
+    "hold_ms": 1000,
+    "zones": [
+      {
+        "id": "zmubiv4oo",
+        "name": "Zona 1",
+        "level": "advertencia",
+        "enabled": true,
+        "points": [
+          [
+            1015,
+            511
+          ],
+          [
+            1170,
+            466
+          ],
+          [
+            1166,
+            350
+          ],
+          [
+            1309,
+            366
+          ],
+          [
+            1344,
+            806
+          ],
+          [
+            1213,
+            883
+          ],
+          [
+            1044,
+            805
+          ]
+        ]
+      },
+      {
+        "id": "zmubj05w6",
+        "name": "Zona2",
+        "level": "peligro",
+        "enabled": true,
+        "points": [
+          [
+            96,
+            406
+          ],
+          [
+            356,
+            335
+          ],
+          [
+            473,
+            659
+          ],
+          [
+            144,
+            759
+          ]
+        ]
+      }
+    ]
+  },
+  "opcua": {
+    "enabled": true,
+    "port": 4841,
+    "namespace": "urn:visionserver"
+  },
+  "tcp": {
+    "enabled": true,
+    "port": 5000,
+    "push_results": false,
+    "format": "csv",
+    "separator": ";"
+  }
+}

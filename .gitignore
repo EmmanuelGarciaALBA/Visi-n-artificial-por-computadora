@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+logs/
+*.tmp
+users.json
+secret.key
+models/
