@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionServer</title>
+<link rel="stylesheet" href="/static/style.css?v=__V__">
+</head>
+<body>
+<header>
+  <div class="brand">👁 VisionServer</div>
+  <nav>
+    <button class="tab active" data-tab="monitor">Inspección <i class="run-dot" data-dot="inspection"></i></button>
+    <button class="tab" data-tab="tools">Recetas y herramientas</button>
+    <button class="tab" data-tab="safety">Zonas de seguridad <i class="run-dot" data-dot="safety"></i></button>
+    <button class="tab" data-tab="camera">Cámara y disparo</button>
+    <button class="tab" data-tab="comms">Comunicación</button>
+  </nav>
+  <div class="chips">
+    <span class="chip" id="chip-cam">Cámara</span>
+    <span class="chip" id="chip-opc">OPC UA</span>
+    <span class="chip" id="chip-tcp">TCP</span>
+    <span class="chip" id="chip-ws">Web</span>
+  </div>
+  <div class="user-box"><span>👤 <b id="me-user"></b> · <span id="me-role"></span></span>
+    <button id="btn-logout">Salir</button></div>
+</header>
+<div class="alarm" id="alarm" hidden></div>
+
+<main>
+  <!-- ======================= MONITOR ======================= -->
+  <section id="tab-monitor" class="tab-page active">
+    <div class="card module-bar">
+      <div class="module-title">Inspección <span class="state-pill" data-pill="inspection">Detenido</span></div>
+      <label class="recipe-pick" title="Receta activa">Receta
+        <select id="recipe-select"></select></label>
+      <button class="run-btn" data-module="inspection">▶ Ejecutar</button>
+    </div>
+    <div class="grid">
+      <div class="card viewer">
+        <div class="viewer-bar">
+          <label><input type="radio" name="view" value="live" checked> En vivo</label>
+          <label><input type="radio" name="view" value="result"> Última inspección</label>
+          <button id="btn-trigger" class="primary">Disparar inspección</button>
+        </div>
+        <img id="stream" alt="video">
+      </div>
+      <div class="side">
+        <div class="card result-tile" id="result-tile">
+          <div class="big" id="res-pass">—</div>
+          <div class="meta"><span>#<b id="res-counter">0</b></span><span><b id="res-cycle">0</b> ms</span><span id="res-source"></span></div>
+          <div class="meta" id="res-recipe"></div>
+        </div>
+        <div class="card">
+          <h3>Herramientas</h3>
+          <table class="tbl" id="res-tools"><thead><tr><th>Nombre</th><th>Valor</th><th>Rango</th><th></th></tr></thead><tbody></tbody></table>
+        </div>
+        <div class="card">
+          <h3>Historial</h3>
+          <div class="history" id="history"></div>
+          <div class="stats" id="stats"></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= RECETAS Y HERRAMIENTAS ======================= -->
+  <section id="tab-tools" class="tab-page">
+    <div class="grid">
+      <div class="card viewer">
+        <div class="viewer-bar">
+          <span class="live-tag">● EN VIVO</span>
+          <span class="hint">Selecciona una herramienta y arrastra sobre la imagen para dibujar su ROI.</span>
+        </div>
+        <div class="roi-wrap">
+          <img id="snap" alt="video en vivo">
+          <canvas id="roi-canvas"></canvas>
+        </div>
+      </div>
+      <div class="side">
+        <div class="card form">
+          <h3>Receta en edición</h3>
+          <p class="hint">Se edita la receta activa. El PLC la cambia por número (OPC UA <span class="mono">Control.RecipeNumber</span> o TCP <span class="mono">RECIPE n</span>).</p>
+          <div class="two"><label>Número <input id="rcp-number" type="number" min="1"></label>
+            <label>Nombre <input id="rcp-name"></label></div>
+          <div class="row-end admin-only">
+            <button id="btn-rcp-new">Nueva</button>
+            <button id="btn-rcp-dup">Duplicar</button>
+            <button class="danger" id="btn-rcp-del">Eliminar</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row-between"><h3>Herramientas</h3>
+            <span class="admin-only"><select id="new-tool-type"></select> <button id="btn-add-tool">+ Agregar</button></span></div>
+          <div id="tool-list"></div>
+          <div class="row-end"><button class="primary admin-only" id="btn-save-tools">Guardar receta</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= ZONAS DE SEGURIDAD ======================= -->
+  <section id="tab-safety" class="tab-page">
+    <div class="card module-bar">
+      <div class="module-title">Zonas de seguridad <span class="state-pill" data-pill="safety">Detenido</span></div>
+      <span class="hint" id="safety-counts"></span>
+      <button class="run-btn" data-module="safety">▶ Ejecutar</button>
+    </div>
+    <div class="grid">
+      <div class="card viewer">
+        <div class="viewer-bar">
+          <label><input type="radio" name="zview" value="live" checked> En vivo</label>
+          <label><input type="radio" name="zview" value="edit"> Editar zonas</label>
+          <span class="hint" id="zone-hint"></span>
+        </div>
+        <img id="safety-stream" alt="video zonas">
+        <div class="roi-wrap" id="zone-editor" hidden>
+          <img id="zone-snap" alt="video en vivo">
+          <canvas id="zone-canvas"></canvas>
+        </div>
+      </div>
+      <div class="side">
+        <div class="card">
+          <h3>Estado de zonas</h3>
+          <div id="safety-summary" class="hint">Detenido</div>
+        </div>
+        <div class="card form">
+          <h3>Monitor de personas</h3>
+          <div class="two"><label>Cuadros por segundo <input id="saf-fps" type="number" min="0.5" max="30" step="0.5"></label>
+            <label>Confianza mínima <input id="saf-conf" type="number" min="0.1" max="0.95" step="0.05"></label></div>
+          <div class="two"><label>Detección
+            <select id="saf-mode"><option value="pies">Pies dentro de la zona</option>
+              <option value="caja">Cualquier parte del cuerpo</option></select></label>
+            <label>Retardo al liberar (ms) <input id="saf-hold" type="number" min="0" step="100"></label></div>
+          <label>Modelo YOLO <input id="saf-model"></label>
+          <p class="warn-note">⚠ Función de asistencia. No es un sistema de seguridad certificado y no sustituye cortinas de luz, escáneres de seguridad ni paros de emergencia.</p>
+        </div>
+        <div class="card">
+          <div class="row-between"><h3>Zonas</h3>
+            <span class="admin-only"><button id="btn-add-zone">+ Nueva zona</button></span></div>
+          <div id="zone-list"></div>
+          <div class="row-end"><button class="primary admin-only" id="btn-save-safety">Guardar</button></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================= CÁMARA ======================= -->
+  <section id="tab-camera" class="tab-page">
+    <div class="grid">
+    <div class="card viewer">
+      <div class="viewer-bar"><span class="live-tag">● EN VIVO</span><span class="hint" id="cam-info"></span></div>
+      <img id="cam-stream" alt="video en vivo">
+    </div>
+    <div class="card form">
+      <h3>Fuente de imagen</h3>
+      <label>Tipo
+        <select id="cam-type">
+          <option value="test">Patrón de prueba (simulado)</option>
+          <option value="usb">Cámara USB</option>
+          <option value="url">Cámara IP (RTSP / HTTP)</option>
+          <option value="folder">Carpeta de imágenes</option>
+        </select></label>
+      <label>Fuente <input id="cam-source" placeholder="0  |  rtsp://192.168.1.37:554/stream1  |  C:\imagenes"></label>
+      <p class="hint">Cámara TP-Link Tapo: <span class="mono">rtsp://IP:554/stream1</span> (alta resolución) o <span class="mono">/stream2</span> (baja). El usuario y contraseña son la "Cuenta de cámara" creada en la app Tapo (Configuración avanzada).</p>
+      <div class="two"><label>Usuario de cámara <input id="cam-user" autocomplete="off"></label>
+        <label>Contraseña de cámara <input id="cam-password" type="password" autocomplete="new-password"></label></div>
+      <div class="two"><label>Ancho <input id="cam-width" type="number"></label><label>Alto <input id="cam-height" type="number"></label></div>
+      <h3>Disparo</h3>
+      <label>Modo
+        <select id="trg-mode">
+          <option value="continuous">Continuo (inspección periódica)</option>
+          <option value="external">Externo (OPC UA / TCP / botón)</option>
+        </select></label>
+      <label>Intervalo en modo continuo (ms) <input id="trg-interval" type="number" min="20"></label>
+      <div class="row-end"><button class="primary admin-only" id="btn-save-camera">Guardar</button></div>
+    </div>
+    </div>
+  </section>
+
+  <!-- ======================= COMUNICACIÓN ======================= -->
+  <section id="tab-comms" class="tab-page">
+    <div class="grid2">
+      <div class="card form">
+        <h3>OPC UA (servidor)</h3>
+        <label class="check"><input type="checkbox" id="opc-enabled"> Habilitado</label>
+        <div class="two"><label>Puerto <input id="opc-port" type="number"></label><label>Namespace URI <input id="opc-ns"></label></div>
+        <p class="hint">Endpoints (sin seguridad, acceso anónimo):</p>
+        <ul id="opc-endpoints" class="mono"></ul>
+        <details><summary>Nodos disponibles</summary>
+<pre class="mono">VisionServer.Control.Trigger            Bool   RW  True → inspecciona → vuelve a False
+VisionServer.Control.ResetCounter       Bool   RW
+VisionServer.Control.RecipeNumber       Int32  RW  número de receta a cargar
+VisionServer.Status.Heartbeat           UInt32
+VisionServer.Status.Ready / Busy / CameraOk     Bool
+VisionServer.Status.Error               String
+VisionServer.Status.ActiveRecipeNumber  Int32
+VisionServer.Status.ActiveRecipeName    String
+VisionServer.Result.Counter             UInt32
+VisionServer.Result.Pass                Bool
+VisionServer.Result.CycleTimeMs         Double
+VisionServer.Result.Timestamp           String
+VisionServer.Tools.&lt;Nombre&gt;.Value       Double
+VisionServer.Tools.&lt;Nombre&gt;.Pass        Bool
+VisionServer.Tools.&lt;Nombre&gt;.Text        String  (códigos leídos)
+VisionServer.Safety.Enabled / Danger / Warning  Bool
+VisionServer.Safety.PersonCount         UInt32
+VisionServer.Safety.Zones.&lt;Nombre&gt;.Occupied  Bool
+VisionServer.Safety.Zones.&lt;Nombre&gt;.Count     UInt32
+(NodeId: ns=&lt;índice del namespace&gt;;s=&lt;ruta&gt;)</pre></details>
+      </div>
+      <div class="card form">
+        <h3>TCP/IP (servidor ASCII)</h3>
+        <label class="check"><input type="checkbox" id="tcp-enabled"> Habilitado</label>
+        <div class="two"><label>Puerto <input id="tcp-port" type="number"></label>
+          <label>Formato <select id="tcp-format"><option value="csv">CSV</option><option value="json">JSON</option></select></label></div>
+        <div class="two"><label>Separador CSV <input id="tcp-sep" maxlength="3"></label>
+          <label class="check"><input type="checkbox" id="tcp-push"> Enviar resultados y alarmas a todos los clientes</label></div>
+        <p class="hint">Clientes conectados: <b id="tcp-clients">0</b></p>
+        <details><summary>Protocolo</summary>
+<pre class="mono">Comandos (terminar con CR o CRLF):
+  TRIGGER | T   → ejecuta inspección y responde
+  GET           → último resultado
+  STATUS        → READY;&lt;camaraOk&gt;;&lt;modo&gt;
+  RECIPE &lt;n&gt;    → carga receta n  → RCP;&lt;n&gt;;&lt;nombre&gt;
+  RECIPE?       → receta activa
+  SAFETY        → SAF;&lt;peligro&gt;;&lt;advertencia&gt;;&lt;personas&gt;;&lt;zona1&gt;;...
+  RESET         → reinicia contador
+  PING          → PONG
+Respuesta CSV:
+  RES;&lt;contador&gt;;&lt;1=OK|0=NOK&gt;;&lt;ciclo_ms&gt;;&lt;herr1&gt;;&lt;herr2&gt;...
+  (los lectores de código envían el texto leído)</pre></details>
+      </div>
+      <div class="card form">
+        <h3>Servidor web</h3>
+        <p class="hint">Abre cualquiera de estas direcciones desde otra PC de la misma red:</p>
+        <ul id="web-urls" class="mono"></ul>
+        <div class="two"><label>Puerto web <input id="srv-port" type="number"></label><span></span></div>
+        <p class="hint">Cambiar el puerto web requiere reiniciar el servicio.</p>
+      </div>
+    </div>
+    <div class="row-end"><button class="primary admin-only" id="btn-save-comms">Guardar</button></div>
+  </section>
+</main>
+<div id="toast"></div>
+<script src="/static/app.js?v=__V__"></script>
+</body>
+</html>

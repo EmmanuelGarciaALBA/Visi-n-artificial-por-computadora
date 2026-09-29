@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VisionServer · Iniciar sesión</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <form class="card login-card" id="login-form" autocomplete="on">
+    <div class="login-brand">👁 VisionServer</div>
+    <p class="hint">Sistema de visión artificial</p>
+    <label>Usuario<input id="user" name="username" autocomplete="username" required autofocus></label>
+    <label>Contraseña<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+    <div class="login-error" id="error"></div>
+    <button class="primary" type="submit" id="btn">Entrar</button>
+  </form>
+  <script src="/static/login.js"></script>
+</body>
+</html>
