@@ -1,4 +1,5 @@
-"""VisionServer: servicio web de visión artificial con comunicación OPC UA y TCP/IP.
+"""VisionServer: 4 bloques de visión (zonas de seguridad, EPP, ANDON, stock) con interfaz web,
+alarmas (sonido y correo) y comunicación OPC UA y TCP/IP.
 
 Se abre desde cualquier PC de la misma red en  http://<IP-del-servidor>:<puerto>
 """
@@ -6,11 +7,9 @@ import asyncio
 import copy
 import logging
 import socket
-import threading
+import textwrap
 from contextlib import asynccontextmanager
 from pathlib import Path
-
-import textwrap
 
 import cv2
 import numpy as np
@@ -18,25 +17,21 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import auth
+from . import auth, notify
 from .comms.opcua_server import OpcUaServer
 from .comms.tcp_server import TcpServer
-from .config import active_recipe, load_config, save_config
+from .config import MODULE_NAMES, load_config, save_config
+from .hub import Hub
 from .vision import yolo
-from .vision.engine import VisionEngine
-from .vision.safety import SafetyMonitor
-from .vision.tools import TOOLS
 
 log = logging.getLogger("main")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
 class State:
-    engine: VisionEngine = None
-    safety: SafetyMonitor = None
+    hub: Hub = None
     opcua: OpcUaServer = None
     tcp: TcpServer = None
-    cfg: dict = None
     websockets: set = set()
     loop: asyncio.AbstractEventLoop = None
 
@@ -44,16 +39,39 @@ class State:
 S = State()
 
 
+def lan_ips():
+    ips = set()
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:  # IP de la interfaz con ruta por defecto
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    ips = {ip for ip in ips if not ip.startswith(("127.", "169.254."))}
+    return sorted(ips) or ["127.0.0.1"]
+
+
+def web_urls():
+    return [f"http://{ip}:{S.hub.cfg['server']['port']}" for ip in lan_ips()]
+
+
 async def start_comms():
-    if S.cfg["opcua"]["enabled"]:
-        S.opcua = OpcUaServer(S.engine, S.cfg, S.safety)
+    cfg = S.hub.cfg
+    if cfg["opcua"]["enabled"]:
+        S.opcua = OpcUaServer(S.hub)
         try:
             await S.opcua.start()
         except Exception as e:
             log.exception("No se pudo iniciar OPC UA")
             S.opcua.error = str(e)
-    if S.cfg["tcp"]["enabled"]:
-        S.tcp = TcpServer(S.engine, S.cfg, S.safety)
+    if cfg["tcp"]["enabled"]:
+        S.tcp = TcpServer(S.hub)
         try:
             await S.tcp.start()
         except Exception as e:
@@ -71,57 +89,6 @@ async def stop_comms():
     S.opcua = S.tcp = None
 
 
-def _ws_listener(result):
-    if S.loop:
-        asyncio.run_coroutine_threadsafe(_ws_broadcast({"type": "result", "data": result}), S.loop)
-
-
-def _ws_safety_listener(state):
-    if S.loop:
-        asyncio.run_coroutine_threadsafe(_ws_broadcast({"type": "safety", "data": state}), S.loop)
-
-
-def _recipe_listener(recipe):
-    """Cambio de receta (desde PLC, TCP o web): reconstruir nodos OPC UA y avisar a los navegadores."""
-    if S.loop:
-        asyncio.run_coroutine_threadsafe(_on_recipe_changed(recipe), S.loop)
-
-
-async def _on_recipe_changed(recipe):
-    if S.opcua:
-        await S.opcua.rebuild_tools()
-    await _ws_broadcast({"type": "recipe", "data": {"id": recipe["id"], "number": recipe["number"],
-                                                    "name": recipe["name"]}})
-
-
-def _uses_yolo(cfg):
-    return cfg["safety"].get("enabled") or any(
-        t["type"] in ("person_detect", "yolo_detect") for r in cfg["recipes"] for t in r.get("tools", []))
-
-
-def _warm_up_yolo(cfg):
-    """Carga el modelo en segundo plano para que la primera inspección no tarde ~15 s."""
-    def run():
-        try:
-            yolo.detect(__import__("numpy").zeros((64, 64, 3), "uint8"), cfg["safety"].get("model"))
-            log.info("Modelo YOLO listo")
-        except Exception:
-            log.exception("No se pudo cargar YOLO")
-    if _uses_yolo(cfg):
-        threading.Thread(target=run, name="yolo-warmup", daemon=True).start()
-
-
-def _signature(cfg):
-    """Lo que define los nodos OPC UA dinámicos: herramientas de la receta activa y zonas."""
-    r = active_recipe(cfg)
-    return (r["id"], [(t["id"], t["name"]) for t in r.get("tools", [])],
-            [(z["id"], z["name"]) for z in cfg["safety"].get("zones", [])])
-
-
-def _modules():
-    return {"inspection": S.engine.running, "safety": bool(S.cfg["safety"].get("enabled"))}
-
-
 async def _ws_broadcast(msg):
     for ws in list(S.websockets):
         try:
@@ -130,23 +97,54 @@ async def _ws_broadcast(msg):
             S.websockets.discard(ws)
 
 
+def _from_thread(msg):
+    if S.loop:
+        asyncio.run_coroutine_threadsafe(_ws_broadcast(msg), S.loop)
+
+
+def _state_listener(module, state):
+    _from_thread({"type": "module", "name": module.name, "data": state})
+
+
+def _event_listener(ev):
+    _from_thread({"type": "event", "data": ev})
+
+
+def _recipe_listener(module, recipe):
+    """Cambio de receta (web, PLC o TCP): reconstruir nodos OPC UA y avisar a los navegadores."""
+    if S.loop:
+        asyncio.run_coroutine_threadsafe(_on_recipe_changed(module, recipe), S.loop)
+
+
+async def _on_recipe_changed(module, recipe):
+    if S.opcua:
+        await S.opcua.rebuild_tools()
+    await _ws_broadcast({"type": "recipe", "name": module.name,
+                         "data": {k: recipe[k] for k in ("id", "number", "name")}})
+
+
+def _signature(cfg):
+    """Lo que define los nodos OPC UA dinámicos: cámaras y herramientas de la receta activa."""
+    from .config import active_recipe
+    return ([(c["id"], c["name"]) for c in cfg["cameras"]],
+            [(n, active_recipe(cfg["modules"][n])["id"],
+              [(t["id"], t["name"]) for t in active_recipe(cfg["modules"][n]).get("tools", [])])
+             for n in MODULE_NAMES])
+
+
 @asynccontextmanager
 async def lifespan(app):
     S.loop = asyncio.get_running_loop()
-    S.cfg = load_config()
-    S.engine = VisionEngine(S.cfg)
-    S.engine.add_listener(_ws_listener)
-    S.engine.add_recipe_listener(_recipe_listener)
-    S.safety = SafetyMonitor(S.engine)
-    S.safety.add_listener(_ws_safety_listener)
-    _warm_up_yolo(S.cfg)
+    S.hub = Hub(load_config(), web_urls)
+    for m in S.hub.modules.values():
+        m.add_listener(_state_listener)
+    S.hub.alarms.add_listener(_event_listener)
+    S.hub.add_recipe_listener(_recipe_listener)
     await start_comms()
-    urls = ", ".join(f"http://{ip}:{S.cfg['server']['port']}" for ip in lan_ips())
-    log.info("Interfaz web disponible en: %s", urls)
+    log.info("Interfaz web disponible en: %s", ", ".join(web_urls()))
     yield
     await stop_comms()
-    S.safety.stop()
-    S.engine.stop()
+    await asyncio.get_running_loop().run_in_executor(None, S.hub.stop)
 
 
 app = FastAPI(title="VisionServer", lifespan=lifespan)
@@ -182,6 +180,13 @@ def _require_admin(request: Request):
     return None
 
 
+def _module_or_404(name):
+    m = S.hub.module(name)
+    if m is None:
+        return None, JSONResponse({"error": f"Bloque desconocido: {name}"}, status_code=404)
+    return m, None
+
+
 @app.get("/login")
 async def login_page():
     return FileResponse(WEB_DIR / "login.html")
@@ -213,24 +218,6 @@ async def me(request: Request):
     return request.state.session
 
 
-def lan_ips():
-    ips = set()
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            ips.add(info[4][0])
-    except OSError:
-        pass
-    try:  # IP de la interfaz con ruta por defecto
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("10.255.255.255", 1))
-        ips.add(s.getsockname()[0])
-        s.close()
-    except OSError:
-        pass
-    ips = {ip for ip in ips if not ip.startswith(("127.", "169.254."))}
-    return sorted(ips) or ["127.0.0.1"]
-
-
 # ------------------------------------------------------------------ páginas
 def _ui_version():
     """Cambia cada vez que se modifica un archivo de la interfaz (evita cachés viejas)."""
@@ -243,34 +230,32 @@ async def index():
     return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
 
-# ------------------------------------------------------------------ API
+# ------------------------------------------------------------------ estado y configuración
 @app.get("/api/status")
 async def status():
-    e = S.engine
-    _, frame = e.camera.latest()
+    cfg = S.hub.cfg
     return {
-        "camera": {"ok": e.camera.error is None, "error": e.camera.error, "fps": round(e.camera.fps, 1),
-                   "size": [frame.shape[1], frame.shape[0]] if frame is not None else None},
-        "opcua": {"enabled": S.cfg["opcua"]["enabled"], "running": bool(S.opcua and S.opcua.running),
+        "cameras": S.hub.cameras.status(),
+        "opcua": {"enabled": cfg["opcua"]["enabled"], "running": bool(S.opcua and S.opcua.running),
                   "error": getattr(S.opcua, "error", None),
-                  "endpoints": [f"opc.tcp://{ip}:{S.cfg['opcua']['port']}/visionserver/" for ip in lan_ips()]},
-        "tcp": {"enabled": S.cfg["tcp"]["enabled"], "running": bool(S.tcp and S.tcp.running),
-                "error": getattr(S.tcp, "error", None), "port": S.cfg["tcp"]["port"],
+                  "endpoints": [f"opc.tcp://{ip}:{cfg['opcua']['port']}/visionserver/" for ip in lan_ips()]},
+        "tcp": {"enabled": cfg["tcp"]["enabled"], "running": bool(S.tcp and S.tcp.running),
+                "error": getattr(S.tcp, "error", None), "port": cfg["tcp"]["port"],
                 "clients": len(S.tcp.clients) if S.tcp else 0},
-        "web": [f"http://{ip}:{S.cfg['server']['port']}" for ip in lan_ips()],
-        "last_result": e.last_result,
-        "safety": S.safety.state,
-        "modules": _modules(),
-        "recipe": {k: e.recipe[k] for k in ("id", "number", "name")},
-        "tool_types": list(TOOLS.keys()),
+        "web": web_urls(),
+        "email_configured": notify.is_configured(cfg["email"]),
+        "modules": {n: m.state for n, m in S.hub.modules.items()},
     }
 
 
 @app.get("/api/config")
 async def get_config():
-    cfg = copy.deepcopy(S.cfg)
-    if cfg["camera"].get("password"):
-        cfg["camera"]["password"] = MASK
+    cfg = copy.deepcopy(S.hub.cfg)
+    for c in cfg["cameras"]:
+        if c.get("password"):
+            c["password"] = MASK
+    if cfg["email"].get("password"):
+        cfg["email"]["password"] = MASK
     return cfg
 
 
@@ -278,85 +263,131 @@ async def get_config():
 async def put_config(new_cfg: dict, request: Request):
     if (denied := _require_admin(request)) is not None:
         return denied
-    old = S.cfg
+    old = S.hub.cfg
     cfg = copy.deepcopy(new_cfg)
-    if cfg["camera"].get("password") == MASK:  # sin cambios: conservar la guardada
-        cfg["camera"]["password"] = old["camera"].get("password", "")
-    # Ejecutar/Detener solo se cambia con sus botones (/api/modules), nunca al guardar configuración
-    cfg["inspection"] = {**cfg.get("inspection", {}), "running": S.engine.running}
-    cfg["safety"]["enabled"] = bool(old["safety"].get("enabled"))
+    old_cams = {c["id"]: c for c in old["cameras"]}
+    for c in cfg["cameras"]:
+        if c.get("password") == MASK:  # sin cambios: conservar la guardada
+            c["password"] = old_cams.get(c["id"], {}).get("password", "")
+    if cfg["email"].get("password") == MASK:
+        cfg["email"]["password"] = old["email"].get("password", "")
+    # Ejecutar/Detener y el sonido se cambian con sus botones, nunca al guardar configuración
+    for n in MODULE_NAMES:
+        cfg["modules"][n]["running"] = bool(old["modules"][n].get("running"))
+        cfg["modules"][n].setdefault("alarm", {})["sound"] = bool(old["modules"][n]["alarm"].get("sound", True))
     save_config(cfg)
-    S.cfg = cfg
-    S.engine.apply_config(cfg)
+    await asyncio.get_running_loop().run_in_executor(None, S.hub.apply_config, cfg)
     restart_needed = cfg["server"] != old["server"]
     if cfg["opcua"] != old["opcua"] or cfg["tcp"] != old["tcp"]:
         await stop_comms()
         await start_comms()
-    else:
-        for srv in (S.opcua, S.tcp):
-            if srv:
-                srv.cfg = cfg
-        if S.opcua and _signature(cfg) != _signature(old):
-            await S.opcua.rebuild_tools()
-    _warm_up_yolo(cfg)
+    elif S.opcua and _signature(cfg) != _signature(old):
+        await S.opcua.rebuild_tools()
     return {"ok": True, "restart_required": restart_needed}
 
 
-@app.post("/api/recipe/select")
-async def select_recipe(data: dict):
-    """Cambiar de receta lo puede hacer cualquier usuario (operador incluido)."""
-    r = await asyncio.get_running_loop().run_in_executor(None, S.engine.select_recipe, data.get("key"))
+@app.get("/api/models")
+async def models():
+    return yolo.available_models()
+
+
+# ------------------------------------------------------------------ operación de los bloques
+# Ejecutar/Detener, sonido, receta y contadores los puede usar cualquier usuario (operador incluido)
+@app.post("/api/modules/{name}/run")
+async def set_running(name: str, data: dict):
+    m, err = _module_or_404(name)
+    if err:
+        return err
+    await asyncio.get_running_loop().run_in_executor(None, m.set_running, bool(data.get("running")))
+    mods = {n: x.running for n, x in S.hub.modules.items()}
+    await _ws_broadcast({"type": "modules", "data": mods})
+    return mods
+
+
+@app.post("/api/modules/{name}/sound")
+async def set_sound(name: str, data: dict):
+    m, err = _module_or_404(name)
+    if err:
+        return err
+    m.set_sound(bool(data.get("on")))
+    return {"sound": m.cfg["alarm"]["sound"]}
+
+
+@app.post("/api/modules/{name}/recipe")
+async def select_recipe(name: str, data: dict):
+    m, err = _module_or_404(name)
+    if err:
+        return err
+    r = await asyncio.get_running_loop().run_in_executor(None, m.select_recipe, data.get("key"))
     if r is None:
         return JSONResponse({"error": "La receta no existe"}, status_code=404)
     return {"id": r["id"], "number": r["number"], "name": r["name"]}
 
 
-@app.get("/api/safety")
-async def safety_state():
-    return S.safety.state
+@app.post("/api/modules/{name}/reset")
+async def reset_counters(name: str):
+    m, err = _module_or_404(name)
+    if err:
+        return err
+    m.reset_counters()
+    return {"ok": True}
 
 
-@app.post("/api/modules/{name}")
-async def set_module(name: str, data: dict):
-    """Ejecutar/Detener un módulo. Lo puede hacer cualquier usuario (es operación, no configuración)."""
-    running = bool(data.get("running"))
-    if name == "inspection":
-        await asyncio.get_running_loop().run_in_executor(None, S.engine.set_running, running)
-    elif name == "safety":
-        S.cfg["safety"]["enabled"] = running
-        save_config(S.cfg)
-        if running:
-            _warm_up_yolo(S.cfg)
-        log.info("Zonas de seguridad %s", "EN EJECUCIÓN" if running else "DETENIDAS")
-    else:
-        return JSONResponse({"error": f"Módulo desconocido: {name}"}, status_code=404)
-    mods = _modules()
-    await _ws_broadcast({"type": "modules", "data": mods})
-    return mods
+TCP_COMMANDS = {"safety": "SAFETY", "ppe": "EPP", "andon": "ANDON", "stock": "STOCK"}
 
 
-@app.post("/api/trigger")
-async def trigger():
-    r = await asyncio.get_running_loop().run_in_executor(None, S.engine.inspect, "web")
-    if r is None:
-        return JSONResponse({"error": "La inspección está detenida. Presiona Ejecutar."}, status_code=409)
-    return r
+@app.get("/api/modules/{name}/comms")
+async def module_comms(name: str):
+    """Nodos OPC UA y respuesta TCP del bloque, con sus valores actuales (pestaña Comunicación)."""
+    from .comms.opcua_server import LEVEL_NUM, _unique_names
+    m, err = _module_or_404(name)
+    if err:
+        return err
+    s, b, rec = m.state, m.opc_folder, m.recipe
+    rows = [(f"{b}.Enabled", "Bool", s["running"]), (f"{b}.Alarm", "Bool", s["alarm"]),
+            (f"{b}.Warning", "Bool", s["warning"]), (f"{b}.Level", "Int32", LEVEL_NUM.get(s["level"], 0)),
+            (f"{b}.AlarmText", "String", s.get("text", "")), (f"{b}.Error", "String", s.get("error") or ""),
+            (f"{b}.RecipeNumber", "Int32 RW", rec["number"]), (f"{b}.ActiveRecipeName", "String", rec["name"]),
+            (f"{b}.ResetCounters", "Bool RW", False)]
+    rows += [(f"{b}.{n}", vt.replace("Boolean", "Bool"), fn(s)) for n, vt, fn in m.opc_summary]
+    by_id = {t["id"]: t for t in s["tools"]}
+    for t, tname in _unique_names(rec.get("tools", [])):
+        st = by_id.get(t["id"])
+        for n, vt, fn in m.opc_tool_fields:
+            rows.append((f"{b}.{m.opc_tools_folder}.{tname}.{n}", vt.replace("Boolean", "Bool"),
+                         fn(st) if st else None))
+    tcp = S.tcp or TcpServer(S.hub)
+    return {"namespace": S.hub.cfg["opcua"]["namespace"], "opc_enabled": S.hub.cfg["opcua"]["enabled"],
+            "nodes": [{"path": f"VisionServer.{p}", "type": t, "value": v} for p, t, v in rows],
+            "tcp_enabled": S.hub.cfg["tcp"]["enabled"], "tcp_port": S.hub.cfg["tcp"]["port"],
+            "tcp_command": TCP_COMMANDS[m.name], "tcp_response": tcp.format_state(m)}
 
 
+@app.get("/api/events")
+async def events(module: str = "", limit: int = 100):
+    return S.hub.alarms.list(module or None, max(1, min(limit, 400)))
+
+
+@app.post("/api/email/test")
+async def email_test(data: dict, request: Request):
+    if (denied := _require_admin(request)) is not None:
+        return denied
+    m = S.hub.module(data.get("module", "")) if data.get("module") else None
+    try:
+        to = await asyncio.get_running_loop().run_in_executor(None, S.hub.alarms.test_email, m, data.get("to"))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, "to": to}
+
+
+# ------------------------------------------------------------------ video
 def _placeholder(msg):
     """Cuadro negro con el motivo por el que no hay imagen."""
     img = np.zeros((360, 640, 3), np.uint8)
     cv2.putText(img, "SIN IMAGEN DE LA CAMARA", (40, 150), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 80, 230), 2)
-    for i, line in enumerate(textwrap.wrap(msg or "", 55)[:4]):
+    from .vision.module import ascii_text
+    for i, line in enumerate(textwrap.wrap(ascii_text(msg or ""), 55)[:4]):
         cv2.putText(img, line, (40, 200 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    return img
-
-
-def _stopped(img, text):
-    """Imagen en vivo con una franja que indica que el módulo está detenido."""
-    img = img.copy()
-    cv2.rectangle(img, (0, img.shape[0] - 40), (img.shape[1], img.shape[0]), (20, 20, 20), -1)
-    cv2.putText(img, text, (12, img.shape[0] - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (150, 150, 150), 2)
     return img
 
 
@@ -366,48 +397,30 @@ def _jpeg(img, quality=80):
 
 
 @app.get("/api/snapshot.jpg")
-async def snapshot():
-    _, img = S.engine.camera.latest()
+async def snapshot(cam: str = "cam1"):
+    _, img = S.hub.cameras.latest(cam)
     if img is None:
         return JSONResponse({"error": "sin imagen"}, status_code=503)
     return Response(_jpeg(img, 90), media_type="image/jpeg")
 
 
 @app.get("/stream.mjpg")
-async def stream(view: str = "result"):
-    """Video MJPEG. view=live (en vivo con ROIs) | result (última inspección) | safety (zonas)
-    | raw (cámara sin anotaciones, para dibujar ROIs y zonas)."""
+async def stream(cam: str = "cam1", view: str = "raw"):
+    """Video MJPEG de una cámara. view=raw (sin anotaciones, para dibujar herramientas)
+    | safety | ppe | andon | stock (anotado por ese bloque)."""
+    module = S.hub.modules.get(view)
 
     async def gen():
         loop = asyncio.get_running_loop()
         while True:
-            if view == "safety":
-                _, img = S.engine.camera.latest()
-                if img is not None:
-                    if S.safety.state["running"]:
-                        img = S.safety.annotate(img)  # cuadro actual + última detección
-                    elif not S.cfg["safety"].get("enabled"):
-                        img = _stopped(img, "EN VIVO - MONITOR DE ZONAS DETENIDO")
-            elif view == "raw":
-                _, img = S.engine.camera.latest()
-            elif view == "live":
-                img = S.engine.live_view()
-                if img is not None and not S.engine.running:
-                    img = _stopped(img, "EN VIVO - INSPECCION DETENIDA")
-            elif S.engine.running:
-                img = S.engine.last_image
-                if img is None:
-                    img = S.engine.live_view()
-            else:
-                img = S.engine.live_view()
-                if img is not None:
-                    img = _stopped(img, "INSPECCION DETENIDA")
+            _, img = S.hub.cameras.latest(cam)
             if img is None:
-                img = _placeholder(S.engine.camera.error or "Esperando imagen...")
-            if img is not None:
-                data = await loop.run_in_executor(None, _jpeg, img)
-                if data:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
+                img = _placeholder(S.hub.cameras.error(cam) or "Esperando imagen...")
+            elif module is not None:
+                img = module.annotate(cam, img)
+            data = await loop.run_in_executor(None, _jpeg, img)
+            if data:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + data + b"\r\n"
             await asyncio.sleep(0.1)
 
     return StreamingResponse(gen(), media_type="multipart/x-mixed-replace; boundary=frame")
@@ -421,10 +434,8 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     S.websockets.add(websocket)
     try:
-        if S.engine.last_result:
-            await websocket.send_json({"type": "result", "data": S.engine.last_result})
-        await websocket.send_json({"type": "safety", "data": S.safety.state})
-        await websocket.send_json({"type": "modules", "data": _modules()})
+        for n, m in S.hub.modules.items():
+            await websocket.send_json({"type": "module", "name": n, "data": m.state})
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:

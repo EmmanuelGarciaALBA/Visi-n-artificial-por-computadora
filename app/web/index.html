@@ -10,14 +10,15 @@
 <header>
   <div class="brand">👁 VisionServer</div>
   <nav>
-    <button class="tab active" data-tab="monitor">Inspección <i class="run-dot" data-dot="inspection"></i></button>
-    <button class="tab" data-tab="tools">Recetas y herramientas</button>
-    <button class="tab" data-tab="safety">Zonas de seguridad <i class="run-dot" data-dot="safety"></i></button>
-    <button class="tab" data-tab="camera">Cámara y disparo</button>
-    <button class="tab" data-tab="comms">Comunicación</button>
+    <button class="tab active" data-tab="safety">Zonas de seguridad <i class="run-dot" data-dot="safety"></i></button>
+    <button class="tab" data-tab="ppe">EPP <i class="run-dot" data-dot="ppe"></i></button>
+    <button class="tab" data-tab="andon">ANDON <i class="run-dot" data-dot="andon"></i></button>
+    <button class="tab" data-tab="stock">Stock <i class="run-dot" data-dot="stock"></i></button>
+    <button class="tab" data-tab="cameras">Cámaras</button>
+    <button class="tab" data-tab="system">Sistema</button>
   </nav>
   <div class="chips">
-    <span class="chip" id="chip-cam">Cámara</span>
+    <span class="chip" id="chip-cam">Cámaras</span>
     <span class="chip" id="chip-opc">OPC UA</span>
     <span class="chip" id="chip-tcp">TCP</span>
     <span class="chip" id="chip-ws">Web</span>
@@ -25,223 +26,231 @@
   <div class="user-box"><span>👤 <b id="me-user"></b> · <span id="me-role"></span></span>
     <button id="btn-logout">Salir</button></div>
 </header>
-<div class="alarm" id="alarm" hidden></div>
+<!-- Alarmas activas de los 4 bloques: visibles en todas las pestañas -->
+<div id="alarms"></div>
+<div class="sound-unlock" id="sound-unlock" hidden>🔈 Hay una alarma con sonido: haz clic en cualquier parte de la página para que el navegador permita reproducirlo.</div>
 
 <main>
-  <!-- ======================= MONITOR ======================= -->
-  <section id="tab-monitor" class="tab-page active">
-    <div class="card module-bar">
-      <div class="module-title">Inspección <span class="state-pill" data-pill="inspection">Detenido</span></div>
-      <label class="recipe-pick" title="Receta activa">Receta
-        <select id="recipe-select"></select></label>
-      <button class="run-btn" data-module="inspection">▶ Ejecutar</button>
-    </div>
-    <div class="grid">
-      <div class="card viewer">
-        <div class="viewer-bar">
-          <label><input type="radio" name="view" value="live" checked> En vivo</label>
-          <label><input type="radio" name="view" value="result"> Última inspección</label>
-          <button id="btn-trigger" class="primary">Disparar inspección</button>
-        </div>
-        <img id="stream" alt="video">
-      </div>
-      <div class="side">
-        <div class="card result-tile" id="result-tile">
-          <div class="big" id="res-pass">—</div>
-          <div class="meta"><span>#<b id="res-counter">0</b></span><span><b id="res-cycle">0</b> ms</span><span id="res-source"></span></div>
-          <div class="meta" id="res-recipe"></div>
-        </div>
-        <div class="card">
-          <h3>Herramientas</h3>
-          <table class="tbl" id="res-tools"><thead><tr><th>Nombre</th><th>Valor</th><th>Rango</th><th></th></tr></thead><tbody></tbody></table>
-        </div>
-        <div class="card">
-          <h3>Historial</h3>
-          <div class="history" id="history"></div>
-          <div class="stats" id="stats"></div>
-        </div>
-      </div>
-    </div>
-  </section>
+  <section id="tab-safety" class="tab-page active module-page" data-module="safety"></section>
+  <section id="tab-ppe" class="tab-page module-page" data-module="ppe"></section>
+  <section id="tab-andon" class="tab-page module-page" data-module="andon"></section>
+  <section id="tab-stock" class="tab-page module-page" data-module="stock"></section>
 
-  <!-- ======================= RECETAS Y HERRAMIENTAS ======================= -->
-  <section id="tab-tools" class="tab-page">
+  <!-- ======================= CÁMARAS ======================= -->
+  <section id="tab-cameras" class="tab-page">
     <div class="grid">
       <div class="card viewer">
-        <div class="viewer-bar">
-          <span class="live-tag">● EN VIVO</span>
-          <span class="hint">Selecciona una herramienta y arrastra sobre la imagen para dibujar su ROI.</span>
-        </div>
-        <div class="roi-wrap">
-          <img id="snap" alt="video en vivo">
-          <canvas id="roi-canvas"></canvas>
-        </div>
-      </div>
-      <div class="side">
-        <div class="card form">
-          <h3>Receta en edición</h3>
-          <p class="hint">Se edita la receta activa. El PLC la cambia por número (OPC UA <span class="mono">Control.RecipeNumber</span> o TCP <span class="mono">RECIPE n</span>).</p>
-          <div class="two"><label>Número <input id="rcp-number" type="number" min="1"></label>
-            <label>Nombre <input id="rcp-name"></label></div>
-          <div class="row-end admin-only">
-            <button id="btn-rcp-new">Nueva</button>
-            <button id="btn-rcp-dup">Duplicar</button>
-            <button class="danger" id="btn-rcp-del">Eliminar</button>
-          </div>
-        </div>
-        <div class="card">
-          <div class="row-between"><h3>Herramientas</h3>
-            <span class="admin-only"><select id="new-tool-type"></select> <button id="btn-add-tool">+ Agregar</button></span></div>
-          <div id="tool-list"></div>
-          <div class="row-end"><button class="primary admin-only" id="btn-save-tools">Guardar receta</button></div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ======================= ZONAS DE SEGURIDAD ======================= -->
-  <section id="tab-safety" class="tab-page">
-    <div class="card module-bar">
-      <div class="module-title">Zonas de seguridad <span class="state-pill" data-pill="safety">Detenido</span></div>
-      <span class="hint" id="safety-counts"></span>
-      <button class="run-btn" data-module="safety">▶ Ejecutar</button>
-    </div>
-    <div class="grid">
-      <div class="card viewer">
-        <div class="viewer-bar">
-          <label><input type="radio" name="zview" value="live" checked> En vivo</label>
-          <label><input type="radio" name="zview" value="edit"> Editar zonas</label>
-          <span class="hint" id="zone-hint"></span>
-        </div>
-        <img id="safety-stream" alt="video zonas">
-        <div class="roi-wrap" id="zone-editor" hidden>
-          <img id="zone-snap" alt="video en vivo">
-          <canvas id="zone-canvas"></canvas>
-        </div>
+        <div class="viewer-bar"><span class="live-tag">● EN VIVO</span><span class="hint" id="cam-info"></span></div>
+        <img id="cam-stream" alt="video en vivo">
       </div>
       <div class="side">
         <div class="card">
-          <h3>Estado de zonas</h3>
-          <div id="safety-summary" class="hint">Detenido</div>
+          <div class="row-between"><h3>Cámaras</h3>
+            <span class="admin-only"><button id="btn-add-cam">+ Agregar cámara</button></span></div>
+          <div id="cam-list"></div>
         </div>
-        <div class="card form">
-          <h3>Monitor de personas</h3>
-          <div class="two"><label>Cuadros por segundo <input id="saf-fps" type="number" min="0.5" max="30" step="0.5"></label>
-            <label>Confianza mínima <input id="saf-conf" type="number" min="0.1" max="0.95" step="0.05"></label></div>
-          <div class="two"><label>Detección
-            <select id="saf-mode"><option value="pies">Pies dentro de la zona</option>
-              <option value="caja">Cualquier parte del cuerpo</option></select></label>
-            <label>Retardo al liberar (ms) <input id="saf-hold" type="number" min="0" step="100"></label></div>
-          <label>Modelo YOLO <input id="saf-model"></label>
-          <p class="warn-note">⚠ Función de asistencia. No es un sistema de seguridad certificado y no sustituye cortinas de luz, escáneres de seguridad ni paros de emergencia.</p>
-        </div>
-        <div class="card">
-          <div class="row-between"><h3>Zonas</h3>
-            <span class="admin-only"><button id="btn-add-zone">+ Nueva zona</button></span></div>
-          <div id="zone-list"></div>
-          <div class="row-end"><button class="primary admin-only" id="btn-save-safety">Guardar</button></div>
+        <div class="card form" id="cam-form">
+          <h3>Cámara seleccionada</h3>
+          <div class="two"><label>Nombre <input id="cam-name"></label>
+            <label class="check"><input type="checkbox" id="cam-enabled"> Habilitada</label></div>
+          <label>Tipo
+            <select id="cam-type">
+              <option value="test">Patrón de prueba (simulado)</option>
+              <option value="usb">Cámara USB</option>
+              <option value="url">Cámara IP (RTSP / HTTP)</option>
+              <option value="folder">Carpeta de imágenes</option>
+            </select></label>
+          <label>Fuente <input id="cam-source" placeholder="0  |  rtsp://192.168.1.37:554/stream1  |  C:\imagenes"></label>
+          <p class="hint">Cámara TP-Link Tapo: <span class="mono">rtsp://IP:554/stream1</span> (alta resolución) o <span class="mono">/stream2</span> (baja). El usuario y la contraseña son la "Cuenta de cámara" creada en la app Tapo (Configuración avanzada).</p>
+          <div class="two"><label>Usuario de cámara <input id="cam-user" autocomplete="off"></label>
+            <label>Contraseña de cámara <input id="cam-password" type="password" autocomplete="new-password"></label></div>
+          <div class="two"><label>Ancho <input id="cam-width" type="number"></label><label>Alto <input id="cam-height" type="number"></label></div>
+          <h3>Funciones en esta cámara</h3>
+          <div class="func-grid" id="cam-functions"></div>
+          <p class="hint">Cada función analiza la imagen de las cámaras que la tienen marcada. Las zonas, áreas, torretas y posiciones se dibujan por cámara en cada bloque.</p>
+          <div class="row-end admin-only"><button class="danger" id="btn-del-cam">Eliminar cámara</button>
+            <button class="primary" id="btn-save-cam">Guardar cámaras</button></div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ======================= CÁMARA ======================= -->
-  <section id="tab-camera" class="tab-page">
-    <div class="grid">
-    <div class="card viewer">
-      <div class="viewer-bar"><span class="live-tag">● EN VIVO</span><span class="hint" id="cam-info"></span></div>
-      <img id="cam-stream" alt="video en vivo">
-    </div>
-    <div class="card form">
-      <h3>Fuente de imagen</h3>
-      <label>Tipo
-        <select id="cam-type">
-          <option value="test">Patrón de prueba (simulado)</option>
-          <option value="usb">Cámara USB</option>
-          <option value="url">Cámara IP (RTSP / HTTP)</option>
-          <option value="folder">Carpeta de imágenes</option>
-        </select></label>
-      <label>Fuente <input id="cam-source" placeholder="0  |  rtsp://192.168.1.37:554/stream1  |  C:\imagenes"></label>
-      <p class="hint">Cámara TP-Link Tapo: <span class="mono">rtsp://IP:554/stream1</span> (alta resolución) o <span class="mono">/stream2</span> (baja). El usuario y contraseña son la "Cuenta de cámara" creada en la app Tapo (Configuración avanzada).</p>
-      <div class="two"><label>Usuario de cámara <input id="cam-user" autocomplete="off"></label>
-        <label>Contraseña de cámara <input id="cam-password" type="password" autocomplete="new-password"></label></div>
-      <div class="two"><label>Ancho <input id="cam-width" type="number"></label><label>Alto <input id="cam-height" type="number"></label></div>
-      <h3>Disparo</h3>
-      <label>Modo
-        <select id="trg-mode">
-          <option value="continuous">Continuo (inspección periódica)</option>
-          <option value="external">Externo (OPC UA / TCP / botón)</option>
-        </select></label>
-      <label>Intervalo en modo continuo (ms) <input id="trg-interval" type="number" min="20"></label>
-      <div class="row-end"><button class="primary admin-only" id="btn-save-camera">Guardar</button></div>
-    </div>
-    </div>
-  </section>
-
-  <!-- ======================= COMUNICACIÓN ======================= -->
-  <section id="tab-comms" class="tab-page">
+  <!-- ======================= SISTEMA ======================= -->
+  <section id="tab-system" class="tab-page">
     <div class="grid2">
+      <div class="card form">
+        <h3>Correo electrónico (envío de alarmas)</h3>
+        <label>Servicio
+          <select id="mail-provider">
+            <option value="gmail">Gmail</option>
+            <option value="outlook">Outlook / Microsoft 365</option>
+            <option value="smtp">Servidor SMTP de la empresa</option>
+          </select></label>
+        <div data-prov="smtp" class="two"><label>Servidor SMTP <input id="mail-host" placeholder="smtp.empresa.com"></label>
+          <label>Puerto <input id="mail-port" type="number" placeholder="587"></label></div>
+        <div data-prov="smtp" class="two"><label>Seguridad
+          <select id="mail-security"><option value="starttls">STARTTLS (587)</option><option value="ssl">SSL/TLS (465)</option>
+            <option value="ninguna">Ninguna (25, red interna)</option></select></label>
+          <label>Usuario <input id="mail-user" autocomplete="off" placeholder="vacío = sin autenticación"></label></div>
+        <label><span id="mail-address-label">Correo</span> <input id="mail-address" type="email" autocomplete="off"></label>
+        <label><span id="mail-password-label">Contraseña</span> <input id="mail-password" type="password" autocomplete="new-password"></label>
+        <p class="hint" id="mail-help"></p>
+        <label>Nombre del remitente <input id="mail-from-name" placeholder="VisionServer"></label>
+        <div class="two"><label>Enviar prueba a <input id="mail-test-to" type="email" placeholder="tu@correo.com"></label>
+          <button id="btn-mail-test" class="admin-only">Enviar correo de prueba</button></div>
+        <p class="hint">Los destinatarios de cada bloque se configuran en su pestaña <b>Comunicación y alertas</b>.</p>
+        <div class="row-end"><button class="primary admin-only" id="btn-save-mail">Guardar correo</button></div>
+      </div>
       <div class="card form">
         <h3>OPC UA (servidor)</h3>
         <label class="check"><input type="checkbox" id="opc-enabled"> Habilitado</label>
         <div class="two"><label>Puerto <input id="opc-port" type="number"></label><label>Namespace URI <input id="opc-ns"></label></div>
         <p class="hint">Endpoints (sin seguridad, acceso anónimo):</p>
         <ul id="opc-endpoints" class="mono"></ul>
-        <details><summary>Nodos disponibles</summary>
-<pre class="mono">VisionServer.Control.Trigger            Bool   RW  True → inspecciona → vuelve a False
-VisionServer.Control.ResetCounter       Bool   RW
-VisionServer.Control.RecipeNumber       Int32  RW  número de receta a cargar
-VisionServer.Status.Heartbeat           UInt32
-VisionServer.Status.Ready / Busy / CameraOk     Bool
-VisionServer.Status.Error               String
-VisionServer.Status.ActiveRecipeNumber  Int32
-VisionServer.Status.ActiveRecipeName    String
-VisionServer.Result.Counter             UInt32
-VisionServer.Result.Pass                Bool
-VisionServer.Result.CycleTimeMs         Double
-VisionServer.Result.Timestamp           String
-VisionServer.Tools.&lt;Nombre&gt;.Value       Double
-VisionServer.Tools.&lt;Nombre&gt;.Pass        Bool
-VisionServer.Tools.&lt;Nombre&gt;.Text        String  (códigos leídos)
-VisionServer.Safety.Enabled / Danger / Warning  Bool
-VisionServer.Safety.PersonCount         UInt32
-VisionServer.Safety.Zones.&lt;Nombre&gt;.Occupied  Bool
-VisionServer.Safety.Zones.&lt;Nombre&gt;.Count     UInt32
-(NodeId: ns=&lt;índice del namespace&gt;;s=&lt;ruta&gt;)</pre></details>
-      </div>
-      <div class="card form">
+        <details><summary>Nodos generales</summary>
+<pre class="mono">VisionServer.Status.Heartbeat            UInt32  +1 cada segundo
+VisionServer.Status.CamerasOk            Bool
+VisionServer.Cameras.&lt;Nombre&gt;.Ok / .Fps  Bool / Double
+VisionServer.Safety | PPE | Andon | Stock . ...
+   (los nodos de cada bloque están en su pestaña Comunicación y alertas)
+NodeId: ns=&lt;índice del namespace&gt;;s=&lt;ruta&gt;</pre></details>
         <h3>TCP/IP (servidor ASCII)</h3>
         <label class="check"><input type="checkbox" id="tcp-enabled"> Habilitado</label>
         <div class="two"><label>Puerto <input id="tcp-port" type="number"></label>
           <label>Formato <select id="tcp-format"><option value="csv">CSV</option><option value="json">JSON</option></select></label></div>
         <div class="two"><label>Separador CSV <input id="tcp-sep" maxlength="3"></label>
-          <label class="check"><input type="checkbox" id="tcp-push"> Enviar resultados y alarmas a todos los clientes</label></div>
+          <label class="check"><input type="checkbox" id="tcp-push"> Enviar cada cambio a todos los clientes</label></div>
         <p class="hint">Clientes conectados: <b id="tcp-clients">0</b></p>
-        <details><summary>Protocolo</summary>
-<pre class="mono">Comandos (terminar con CR o CRLF):
-  TRIGGER | T   → ejecuta inspección y responde
-  GET           → último resultado
-  STATUS        → READY;&lt;camaraOk&gt;;&lt;modo&gt;
-  RECIPE &lt;n&gt;    → carga receta n  → RCP;&lt;n&gt;;&lt;nombre&gt;
-  RECIPE?       → receta activa
-  SAFETY        → SAF;&lt;peligro&gt;;&lt;advertencia&gt;;&lt;personas&gt;;&lt;zona1&gt;;...
-  RESET         → reinicia contador
-  PING          → PONG
-Respuesta CSV:
-  RES;&lt;contador&gt;;&lt;1=OK|0=NOK&gt;;&lt;ciclo_ms&gt;;&lt;herr1&gt;;&lt;herr2&gt;...
-  (los lectores de código envían el texto leído)</pre></details>
-      </div>
-      <div class="card form">
+        <details><summary>Comandos generales</summary>
+<pre class="mono">STATUS               → STA;&lt;zonas&gt;;&lt;epp&gt;;&lt;andon&gt;;&lt;stock&gt;;&lt;cámaras ok&gt;/&lt;cámaras&gt;
+RECIPE &lt;bloque&gt; &lt;n&gt;  → RCP;&lt;prefijo&gt;;&lt;n&gt;;&lt;nombre&gt;
+RECIPE &lt;bloque&gt;      → receta activa
+RESET &lt;bloque&gt;       → reinicia contadores
+PING                 → PONG
+&lt;bloque&gt; = SAFETY | EPP | ANDON | STOCK   (terminar con CR o CRLF)</pre></details>
         <h3>Servidor web</h3>
         <p class="hint">Abre cualquiera de estas direcciones desde otra PC de la misma red:</p>
         <ul id="web-urls" class="mono"></ul>
-        <div class="two"><label>Puerto web <input id="srv-port" type="number"></label><span></span></div>
-        <p class="hint">Cambiar el puerto web requiere reiniciar el servicio.</p>
+        <div class="two"><label>Puerto web <input id="srv-port" type="number"></label><span class="hint">Cambiar el puerto web requiere reiniciar el servicio.</span></div>
+        <div class="row-end"><button class="primary admin-only" id="btn-save-comms">Guardar comunicación</button></div>
       </div>
     </div>
-    <div class="row-end"><button class="primary admin-only" id="btn-save-comms">Guardar</button></div>
   </section>
 </main>
+
+<!-- ======================= PLANTILLA DE BLOQUE ======================= -->
+<template id="module-template">
+  <div class="card module-bar">
+    <div class="module-title"><span data-el="title"></span> <span class="state-pill" data-el="pill">Detenido</span></div>
+    <span class="level-pill" data-el="level-pill"></span>
+    <span class="bar-fill"></span>
+    <label class="recipe-pick" title="Receta activa">Receta <select data-el="recipe"></select></label>
+    <label class="recipe-pick" title="Cámara que se muestra y se edita">Cámara <select data-el="camera"></select></label>
+    <button class="sound-btn" data-el="sound" title="Sonido de alarma de este bloque">🔊 Sonido</button>
+    <button class="run-btn" data-el="run">▶ Ejecutar</button>
+  </div>
+  <div class="subtabs">
+    <button class="subtab active" data-sub="monitor">Monitor</button>
+    <button class="subtab" data-sub="tools">Recetas y herramientas</button>
+    <button class="subtab" data-sub="comms">Comunicación y alertas</button>
+  </div>
+
+  <div class="sub-page active" data-subpage="monitor">
+    <div class="grid">
+      <div class="card viewer">
+        <div class="viewer-bar"><span class="live-tag">● EN VIVO</span><span class="hint" data-el="vinfo"></span></div>
+        <img data-el="stream" alt="video">
+      </div>
+      <div class="side">
+        <div class="card result-tile" data-el="tile">
+          <div class="big" data-el="big">—</div>
+          <div class="meta" data-el="meta"></div>
+          <div class="tile-text" data-el="tile-text"></div>
+        </div>
+        <div class="card"><h3 data-el="sum-title">Resumen</h3><div class="kpis" data-el="kpis"></div></div>
+        <div class="card"><h3 data-el="table-title"></h3>
+          <table class="tbl" data-el="table"><thead></thead><tbody></tbody></table></div>
+        <div class="card">
+          <div class="row-between"><h3>Alarmas recientes</h3>
+            <button data-el="reset" title="Reinicia los contadores de este bloque">Reiniciar contadores</button></div>
+          <div class="events" data-el="events"></div>
+          <p class="hint">Historial completo: <span class="mono">logs/alarmas.csv</span> (se abre con Excel).</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sub-page" data-subpage="tools">
+    <div class="grid">
+      <div class="card viewer">
+        <div class="viewer-bar"><span class="live-tag">● EN VIVO</span><span class="hint" data-el="draw-hint"></span></div>
+        <div class="roi-wrap"><img data-el="snap" alt="video en vivo"><canvas data-el="canvas"></canvas></div>
+      </div>
+      <div class="side">
+        <div class="card form">
+          <h3>Receta en edición</h3>
+          <p class="hint">Se edita la receta activa del bloque. El PLC la cambia por número (OPC UA <span class="mono" data-el="rcp-node"></span> o TCP <span class="mono" data-el="rcp-cmd"></span>).</p>
+          <div class="two"><label>Número <input data-el="rcp-number" type="number" min="1"></label>
+            <label>Nombre <input data-el="rcp-name"></label></div>
+          <div data-el="recipe-fields"></div>
+          <div class="row-end admin-only">
+            <button data-el="rcp-new">Nueva</button>
+            <button data-el="rcp-dup">Duplicar</button>
+            <button class="danger" data-el="rcp-del">Eliminar</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row-between"><h3 data-el="list-title"></h3>
+            <span class="admin-only"><button data-el="add-tool"></button></span></div>
+          <p class="hint" data-el="list-hint"></p>
+          <div data-el="tool-list"></div>
+          <div class="row-end"><button class="primary admin-only" data-el="save-tools">Guardar receta</button></div>
+        </div>
+        <div class="card form">
+          <h3>Parámetros de detección</h3>
+          <div class="param-grid" data-el="params"></div>
+          <p class="warn-note" data-el="note"></p>
+          <div class="row-end"><button class="primary admin-only" data-el="save-params">Guardar parámetros</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sub-page" data-subpage="comms">
+    <div class="grid2">
+      <div class="card form">
+        <h3>Alarma</h3>
+        <label class="check"><input type="checkbox" data-el="sound-check"> Sonido de alarma en los navegadores</label>
+        <p class="hint">El botón 🔊 de la barra (y el de la franja de alarma) lo activa o silencia para todos los usuarios.</p>
+        <div class="param-grid" data-el="alarm-params"></div>
+        <h3>Correo electrónico</h3>
+        <p class="hint warn-text" data-el="mail-missing" hidden>Primero configura el servidor de correo en la pestaña <b>Sistema</b>.</p>
+        <label class="check"><input type="checkbox" data-el="mail-enabled"> Enviar correo cuando se active la alarma</label>
+        <label>Destinatarios (separados por coma) <input data-el="mail-to" placeholder="supervisor@empresa.com, seguridad@empresa.com"></label>
+        <div class="two"><label>Enviar desde el nivel
+          <select data-el="mail-level"><option value="advertencia">Advertencia y peligro</option><option value="peligro">Solo peligro</option></select></label>
+          <label>Mínimo entre correos (min) <input data-el="mail-cooldown" type="number" min="0" step="1"></label></div>
+        <label class="check"><input type="checkbox" data-el="mail-image"> Adjuntar la imagen del momento</label>
+        <label class="check"><input type="checkbox" data-el="mail-clear"> Avisar también cuando la alarma se normalice</label>
+        <div class="row-end admin-only"><button data-el="mail-test">Enviar prueba</button>
+          <button class="primary" data-el="save-comms">Guardar alertas</button></div>
+      </div>
+      <div class="card">
+        <h3>OPC UA · nodos de este bloque</h3>
+        <p class="hint" data-el="opc-info"></p>
+        <div class="node-wrap"><table class="tbl mono" data-el="opc-table"><thead><tr><th>Nodo</th><th>Tipo</th><th>Valor</th></tr></thead><tbody></tbody></table></div>
+      </div>
+      <div class="card">
+        <h3>TCP/IP · comando de este bloque</h3>
+        <p class="hint" data-el="tcp-info"></p>
+        <pre class="mono" data-el="tcp-help"></pre>
+        <p class="hint">Respuesta actual:</p>
+        <pre class="mono" data-el="tcp-live"></pre>
+      </div>
+    </div>
+  </div>
+</template>
+
 <div id="toast"></div>
 <script src="/static/app.js?v=__V__"></script>
 </body>

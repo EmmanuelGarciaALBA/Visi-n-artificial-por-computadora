@@ -1,23 +1,22 @@
 """Servidor TCP/IP de texto (ASCII), estilo cámaras inteligentes industriales.
 
-Cada comando termina en CR, LF o CRLF. Respuestas terminan en CRLF.
+Cada comando termina en CR, LF o CRLF. Respuestas terminan en CRLF. Separador configurable (';').
+<bloque> = SAFETY (o ZONAS) | EPP | ANDON | STOCK
 
-  TRIGGER  (o T)   -> ejecuta una inspección y responde con el resultado
-  GET              -> último resultado sin inspeccionar
-  STATUS           -> READY|STOPPED;<camara_ok 0/1>;<modo>   (TRIGGER con STOPPED -> ERR;INSPECTION_STOPPED)
-  RESET            -> reinicia el contador
-  RECIPE <n>       -> carga la receta número n (o por nombre)  -> RCP;<numero>;<nombre>
-  RECIPE?          -> receta activa                            -> RCP;<numero>;<nombre>
   SAFETY           -> SAF;<peligro 0/1>;<advertencia 0/1>;<personas>;<zona1 0/1>;<zona2 0/1>;...
-  PING             -> PONG
+  EPP              -> EPP;<alarma 0/1>;<personas>;<sin_epp>;<sin_casco>;<sin_guantes>;<sin_lentes>;<area1 ok 0/1>;...
+  ANDON            -> AND;<encendidas>;<rojas>;<amarillas>;<verdes>;<torreta1>;<torreta2>;...
+                      cada torreta: letras de las luces encendidas R=rojo A=amarillo V=verde, '-' = apagada
+  STOCK            -> STK;<alarma 0/1>;<cajas>;<racks>;<pos1 cajas:estado>;...   estado: OK|BAJO|VACIO|EXCESO|SINRACK
+  (bloque detenido -> ERR;STOPPED;<prefijo>)
+  STATUS           -> STA;<zonas 0/1>;<epp 0/1>;<andon 0/1>;<stock 0/1>;<cámaras con imagen>/<cámaras>
+  RECIPE <bloque> <n>  -> RCP;<prefijo>;<n>;<nombre>   (o ERR;RECIPE_NOT_FOUND;<n>)
+  RECIPE <bloque>      -> receta activa
+  RESET <bloque>       -> reinicia contadores -> OK
+  PING                 -> PONG
+Formato JSON: el estado completo del bloque en una línea.
 
-Formato CSV (separador configurable, por defecto ';'):
-  RES;<contador>;<1=OK|0=NOK>;<ciclo_ms>;<herr1>;<herr2>;...
-  Cada herramienta envía su valor numérico; los lectores de código envían el texto leído.
-Formato JSON: el resultado completo en una línea.
-
-Con push_results=true, cada inspección (y cada cambio en zonas de seguridad) se envía
-a todos los clientes conectados.
+Con push_results=true, cada cambio en la respuesta de un bloque se envía a todos los clientes.
 """
 import asyncio
 import json
@@ -27,49 +26,40 @@ log = logging.getLogger("tcp")
 
 
 class TcpServer:
-    def __init__(self, engine, cfg, safety=None):
-        self.engine = engine
-        self.safety = safety
-        self._last_saf = None
-        self.cfg = cfg
+    def __init__(self, hub):
+        self.hub = hub
         self.server = None
         self.clients = set()
         self._loop = None
+        self._last = {}
         self.running = False
+        self.error = None
 
-    def format_result(self, r):
-        c = self.cfg["tcp"]
-        if r is None:
-            return "ERR;NO_RESULT"
-        if c.get("format") == "json":
-            return json.dumps(r, ensure_ascii=False)
-        sep = c.get("separator", ";")
-        fields = ["RES", str(r["counter"]), "1" if r["pass"] else "0", f"{r['cycle_ms']:.2f}"]
-        for t in r["tools"]:
-            if t["type"] == "code_reader":
-                text = t.get("text", "")
-                for ch in (sep, "\r", "\n"):
-                    text = text.replace(ch, " ")
-                fields.append(text)
-            else:
-                fields.append(f"{t['value']:g}")
-        return sep.join(fields)
+    @property
+    def cfg(self):
+        return self.hub.cfg
 
-    def format_safety(self, s):
+    def _clean(self, text):
+        for ch in (self.cfg["tcp"].get("separator", ";"), "\r", "\n"):
+            text = text.replace(ch, " ")
+        return text
+
+    def format_state(self, m, s=None):
+        s = s or m.state
         if self.cfg["tcp"].get("format") == "json":
-            return json.dumps(s, ensure_ascii=False)
-        fields = ["SAF", "1" if s["danger"] else "0", "1" if s["warning"] else "0", str(s["persons"])]
-        fields += ["1" if z["occupied"] else "0" for z in s["zones"]]
-        return self.cfg["tcp"].get("separator", ";").join(fields)
+            return json.dumps(s, ensure_ascii=False, default=str)
+        sep = self.cfg["tcp"].get("separator", ";")
+        if not s["running"]:
+            return sep.join(["ERR", "STOPPED", m.tcp_prefix])
+        return sep.join([m.tcp_prefix] + [self._clean(str(f)) for f in m.tcp_fields(s)])
 
     async def start(self):
         self._loop = asyncio.get_running_loop()
         port = self.cfg["tcp"]["port"]
         self.server = await asyncio.start_server(self._handle, "0.0.0.0", port)
         self.running = True
-        self.engine.add_listener(self._on_result)
-        if self.safety:
-            self.safety.add_listener(self._on_safety)
+        for m in self.hub.modules.values():
+            m.add_listener(self._on_state)
         log.info("TCP escuchando en el puerto %s", port)
 
     async def _send(self, writer, line):
@@ -100,49 +90,48 @@ class TcpServer:
             log.info("Cliente TCP desconectado: %s", peer)
 
     async def _command(self, line):
-        cmd, _, arg = line.partition(" ")
-        cmd, arg = cmd.upper(), arg.strip()
-        if cmd in ("T", "TRIGGER"):
-            r = await asyncio.get_running_loop().run_in_executor(None, self.engine.inspect, "tcp")
-            return self.format_result(r) if r else "ERR;INSPECTION_STOPPED"
-        if cmd == "GET":
-            return self.format_result(self.engine.last_result)
-        if cmd == "STATUS":
-            ok = "1" if self.engine.camera.error is None else "0"
-            state = "READY" if self.engine.running else "STOPPED"
-            return f"{state};{ok};{self.engine.cfg['trigger']['mode']}"
-        if cmd == "RESET":
-            self.engine.counter = 0
-            return "OK"
-        if cmd == "RECIPE?" or (cmd == "RECIPE" and not arg):
-            r = self.engine.recipe
-            return f"RCP;{r['number']};{r['name']}"
-        if cmd == "RECIPE":
-            r = await asyncio.get_running_loop().run_in_executor(None, self.engine.select_recipe, arg)
-            return f"RCP;{r['number']};{r['name']}" if r else f"ERR;RECIPE_NOT_FOUND;{arg}"
-        if cmd == "SAFETY":
-            if not self.safety:
-                return "ERR;SAFETY_UNAVAILABLE"
-            return self.format_safety(self.safety.state)
+        sep = self.cfg["tcp"].get("separator", ";")
+        parts = line.split()
+        cmd, args = parts[0].upper(), parts[1:]
         if cmd == "PING":
             return "PONG"
-        return f"ERR;UNKNOWN_COMMAND;{cmd}"
+        if cmd == "STATUS":
+            mods = [("1" if self.hub.modules[n].running else "0") for n in ("safety", "ppe", "andon", "stock")]
+            cams = [c for c in self.hub.cameras.status() if c["enabled"]]
+            return sep.join(["STA", *mods, f"{sum(1 for c in cams if c['ok'])}/{len(cams)}"])
+        if cmd in ("RECIPE", "RECIPE?", "RESET"):
+            m = self.hub.module(args[0].rstrip("?")) if args else None
+            if m is None:
+                return sep.join(["ERR", "UNKNOWN_BLOCK", args[0] if args else ""])
+            if cmd == "RESET":
+                m.reset_counters()
+                return "OK"
+            if len(args) < 2 or cmd == "RECIPE?" or args[0].endswith("?"):
+                r = m.recipe
+                return sep.join(["RCP", m.tcp_prefix, str(r["number"]), self._clean(r["name"])])
+            key = " ".join(args[1:])
+            r = await asyncio.get_running_loop().run_in_executor(None, m.select_recipe, key)
+            if r is None:
+                return sep.join(["ERR", "RECIPE_NOT_FOUND", key])
+            return sep.join(["RCP", m.tcp_prefix, str(r["number"]), self._clean(r["name"])])
+        m = self.hub.module(cmd)
+        if m is not None:
+            return self.format_state(m)
+        return sep.join(["ERR", "UNKNOWN_COMMAND", cmd])
 
-    def _on_result(self, result):
-        # Las respuestas a TRIGGER ya se envían al solicitante; el push es para el resto.
-        if self.running and self.cfg["tcp"].get("push_results") and result["source"] != "tcp":
-            asyncio.run_coroutine_threadsafe(self._broadcast(self.format_result(result)), self._loop)
-
-    def _on_safety(self, state):
-        # Solo se empuja cuando cambia algo relevante, no en cada cuadro
+    def _on_state(self, module, state):
+        # Solo se empuja cuando cambia la respuesta del bloque, no en cada ciclo
         if not (self.running and self.cfg["tcp"].get("push_results")):
             return
-        line = self.format_safety(state) if self.cfg["tcp"].get("format") != "json" else None
-        key = line or (state["danger"], state["warning"], state["persons"],
-                       tuple(z["occupied"] for z in state["zones"]))
-        if key != self._last_saf:
-            self._last_saf = key
-            asyncio.run_coroutine_threadsafe(self._broadcast(self.format_safety(state)), self._loop)
+        if self.cfg["tcp"].get("format") == "json":
+            key = (state["running"], state["level"], json.dumps(state.get("summary"), sort_keys=True),
+                   json.dumps([{k: v for k, v in t.items() if k not in ("activations",)} for t in state["tools"]],
+                              sort_keys=True, default=str))
+        else:
+            key = self.format_state(module, state)
+        if key != self._last.get(module.name):
+            self._last[module.name] = key
+            asyncio.run_coroutine_threadsafe(self._broadcast(self.format_state(module, state)), self._loop)
 
     async def _broadcast(self, line):
         for w in list(self.clients):
@@ -153,9 +142,8 @@ class TcpServer:
 
     async def stop(self):
         self.running = False
-        self.engine.remove_listener(self._on_result)
-        if self.safety:
-            self.safety.remove_listener(self._on_safety)
+        for m in self.hub.modules.values():
+            m.remove_listener(self._on_state)
         if self.server:
             self.server.close()
             for w in list(self.clients):

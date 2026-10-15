@@ -8,14 +8,18 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import threading
 import time
 
+from pathlib import Path
+
 from .config import BASE_DIR
 
-USERS_PATH = BASE_DIR / "users.json"
-SECRET_PATH = BASE_DIR / "secret.key"
+# VS_USERS / VS_SECRET permiten probar con otros archivos sin tocar los de producción
+USERS_PATH = Path(os.environ.get("VS_USERS") or BASE_DIR / "users.json")
+SECRET_PATH = Path(os.environ.get("VS_SECRET") or BASE_DIR / "secret.key")
 COOKIE_NAME = "vs_session"
 SESSION_HOURS = 12
 ROLES = ("admin", "operador")

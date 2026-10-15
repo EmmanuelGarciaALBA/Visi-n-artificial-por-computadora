@@ -3,6 +3,7 @@
 Un hilo de captura mantiene siempre el último frame disponible, así la inspección
 no espera al buffer de la cámara.
 """
+import itertools
 import logging
 import os
 import threading
@@ -21,6 +22,10 @@ log = logging.getLogger("camera")
 
 # Un cuadro más viejo que esto se considera inválido (cámara congelada o desconectada)
 MAX_FRAME_AGE_S = 3.0
+
+# Número de cuadro único en todo el proceso (también entre cámaras reabiertas): es la llave de
+# la caché de detecciones compartida entre bloques.
+_frame_ids = itertools.count(1)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -58,10 +63,27 @@ class TestPatternSource:
         for p in self.parts:
             x = int((p["x"] + dt * speed) % (self.w + 2 * p["r"])) - p["r"]
             cv2.circle(img, (x, int(p["y"])), p["r"], p["c"], -1)
+        self._andon(img, dt)
         noise = np.random.randint(0, 12, img.shape, np.uint8)
         img = cv2.add(img, noise)
         time.sleep(1 / 30)
         return True, img
+
+    def _andon(self, img, dt):
+        """Torreta ANDON simulada (esquina superior derecha): verde 6 s, amarillo intermitente 4 s,
+        rojo 4 s. Sirve para probar el bloque ANDON sin cámara."""
+        x, y0, r = self.w - 60, 30, 18
+        cv2.rectangle(img, (x - 26, y0 - 12), (x + 26, y0 + 3 * 46), (30, 30, 30), -1)
+        t = dt % 14
+        lit = {"red": 10 <= t, "yellow": 6 <= t < 10 and int(t * 2) % 2 == 0, "green": t < 6}
+        colors = (("red", (40, 40, 255)), ("yellow", (0, 210, 255)), ("green", (60, 220, 60)))
+        for i, (name, bgr) in enumerate(colors):
+            c = (x, y0 + 10 + 46 * i)
+            if lit[name]:
+                cv2.circle(img, c, r + 6, tuple(int(v * 0.6) for v in bgr), -1)
+                cv2.circle(img, c, r, bgr, -1)
+            else:
+                cv2.circle(img, c, r, tuple(int(v * 0.25) for v in bgr), -1)
 
     def release(self):
         pass
@@ -155,7 +177,7 @@ class Camera:
                 continue
             with self._lock:
                 self._frame = frame
-                self._frame_id += 1
+                self._frame_id = next(_frame_ids)
                 self._frame_time = time.time()
                 self.error = None
             n += 1
@@ -178,3 +200,78 @@ class Camera:
     def stop(self):
         self._stop.set()
         self._thread.join(timeout=3)
+
+
+# Claves que obligan a reabrir la cámara (cambiar el nombre o las funciones no la reinicia)
+_CAPTURE_KEYS = ("type", "source", "user", "password", "width", "height")
+
+
+class CameraManager:
+    """Todas las cámaras configuradas. Cada una tiene su propio hilo de captura."""
+
+    def __init__(self, cams_cfg):
+        self._cams = {}
+        self._cfg = {}
+        self._lock = threading.Lock()
+        self.apply(cams_cfg)
+
+    def apply(self, cams_cfg):
+        """Abre las cámaras nuevas, reinicia las que cambiaron y cierra las eliminadas o deshabilitadas."""
+        wanted = {c["id"]: c for c in cams_cfg if c.get("enabled", True)}
+        with self._lock:
+            to_stop = []
+            for cid, cam in list(self._cams.items()):
+                new = wanted.get(cid)
+                if new is None or any(new.get(k) != cam.cfg.get(k) for k in _CAPTURE_KEYS):
+                    to_stop.append(self._cams.pop(cid))
+            for cid, c in wanted.items():
+                if cid not in self._cams:
+                    self._cams[cid] = Camera(dict(c))
+                else:
+                    self._cams[cid].cfg = dict(c)
+            self._cfg = {c["id"]: c for c in cams_cfg}
+        for cam in to_stop:
+            cam.stop()
+
+    def ids(self):
+        return [cid for cid in self._cfg]
+
+    def name(self, cid):
+        return self._cfg.get(cid, {}).get("name", cid)
+
+    def with_function(self, function):
+        """Cámaras habilitadas que tienen asignada la función (módulo)."""
+        return [cid for cid, c in self._cfg.items()
+                if c.get("enabled", True) and function in c.get("functions", [])]
+
+    def latest(self, cid):
+        cam = self._cams.get(cid)
+        if cam is None:
+            return 0, None
+        return cam.latest()
+
+    def error(self, cid):
+        cam = self._cams.get(cid)
+        if cam is None:
+            return "Cámara deshabilitada" if cid in self._cfg else "La cámara no existe"
+        return cam.error
+
+    def status(self):
+        out = []
+        for cid, c in self._cfg.items():
+            cam = self._cams.get(cid)
+            size = None
+            if cam is not None and cam._frame is not None:
+                size = [cam._frame.shape[1], cam._frame.shape[0]]
+            out.append({"id": cid, "name": c.get("name", cid), "enabled": c.get("enabled", True),
+                        "functions": c.get("functions", []),
+                        "ok": cam is not None and cam.error is None and size is not None,
+                        "error": self.error(cid) if cam is None else cam.error,
+                        "fps": round(cam.fps, 1) if cam else 0.0, "size": size})
+        return out
+
+    def stop(self):
+        with self._lock:
+            cams, self._cams = list(self._cams.values()), {}
+        for cam in cams:
+            cam.stop()

@@ -1,30 +1,22 @@
-"""Servidor OPC UA: expone resultados, recetas y zonas de seguridad para SCADA/PLC.
+"""Servidor OPC UA: expone el estado de los 4 bloques para SCADA/PLC.
 
-Árbol de nodos (NodeId de tipo string, namespace de la config):
-  VisionServer.Control.Trigger            Bool   (RW)  PLC pone True -> se inspecciona -> el servidor lo regresa a False
-  VisionServer.Control.ResetCounter       Bool   (RW)
-  VisionServer.Control.RecipeNumber       Int32  (RW)  PLC escribe el número de receta a cargar
-  VisionServer.Status.Heartbeat           UInt32       incrementa cada segundo
-  VisionServer.Status.InspectionRunning   Bool         módulo de inspección en ejecución
-  VisionServer.Status.Ready               Bool         en ejecución y sin inspección en curso
-  VisionServer.Status.Busy                Bool
-  VisionServer.Status.CameraOk            Bool
-  VisionServer.Status.Error               String
-  VisionServer.Status.ActiveRecipeNumber  Int32
-  VisionServer.Status.ActiveRecipeName    String
-  VisionServer.Result.Counter             UInt32
-  VisionServer.Result.Pass                Bool
-  VisionServer.Result.CycleTimeMs         Double
-  VisionServer.Result.Timestamp           String
-  VisionServer.Tools.<Nombre>.Value       Double
-  VisionServer.Tools.<Nombre>.Pass        Bool
-  VisionServer.Tools.<Nombre>.Text        String      (lectores de código)
-  VisionServer.Safety.Enabled             Bool        monitor de zonas en ejecución
-  VisionServer.Safety.Danger              Bool        persona en zona de peligro (o falla del monitor)
-  VisionServer.Safety.Warning             Bool
-  VisionServer.Safety.PersonCount         UInt32
-  VisionServer.Safety.Zones.<Nombre>.Occupied  Bool
-  VisionServer.Safety.Zones.<Nombre>.Count     UInt32
+NodeId de tipo string en el namespace de la config:  ns=<idx>;s=VisionServer.<ruta>
+
+  VisionServer.Status.Heartbeat            UInt32   +1 cada segundo
+  VisionServer.Status.CamerasOk            Bool     todas las cámaras habilitadas con imagen
+  VisionServer.Cameras.<Nombre>.Ok / .Fps  Bool / Double
+
+  Por bloque  <B> = Safety | PPE | Andon | Stock:
+  VisionServer.<B>.Enabled                 Bool     bloque en ejecución
+  VisionServer.<B>.Alarm                   Bool     alarma de peligro
+  VisionServer.<B>.Warning                 Bool     advertencia
+  VisionServer.<B>.Level                   Int32    0 normal | 1 advertencia | 2 peligro
+  VisionServer.<B>.AlarmText / .Error      String
+  VisionServer.<B>.RecipeNumber            Int32 RW el PLC escribe el número de receta a cargar
+  VisionServer.<B>.ActiveRecipeName        String
+  VisionServer.<B>.ResetCounters           Bool  RW True -> reinicia contadores -> vuelve a False
+  VisionServer.<B>.<valores del bloque>    (ver opc_summary de cada bloque)
+  VisionServer.<B>.<Carpeta>.<Herramienta>.<campo>   (Zones / Areas / Towers / Positions)
 """
 import asyncio
 import logging
@@ -36,6 +28,7 @@ log = logging.getLogger("opcua")
 logging.getLogger("asyncua").setLevel(logging.WARNING)
 
 V = ua.VariantType
+LEVEL_NUM = {"ninguna": 0, "advertencia": 1, "peligro": 2}
 
 
 def _safe(name):
@@ -54,30 +47,44 @@ def _unique_names(items):
     return out
 
 
+def _coerce(value, vtype):
+    if vtype == V.Boolean:
+        return bool(value)
+    if vtype in (V.UInt32, V.Int32):
+        v = int(value or 0)
+        return max(0, v) % 2 ** 32 if vtype == V.UInt32 else v
+    if vtype == V.Double:
+        return float(value or 0)
+    return str(value or "")
+
+
 class OpcUaServer:
-    def __init__(self, engine, cfg, safety=None):
-        self.engine = engine
-        self.safety = safety
-        self.cfg = cfg
+    def __init__(self, hub):
+        self.hub = hub
         self.server = None
         self.idx = None
-        self.nodes = {}
-        self.tool_nodes = {}
-        self.zone_nodes = {}
-        self.tools_folder = None
-        self.zones_folder = None
+        self.nodes = {}  # ruta -> (nodo, tipo)
+        self.dyn = {}  # bloque -> {tool_id: {campo: (nodo, tipo)}}
+        self.cam_nodes = {}
+        self.folders = {}
+        self._dyn_folders = []
+        self._last = {}  # nodo -> último valor escrito (solo se escriben cambios)
         self._tasks = []
         self._loop = None
         self._build_lock = asyncio.Lock()
-        self._recipe_req = None  # último valor visto en Control.RecipeNumber
+        self._recipe_req = {}
         self.running = False
         self.error = None
+
+    @property
+    def cfg(self):
+        return self.hub.cfg
 
     def _nid(self, path):
         return ua.NodeId(f"VisionServer.{path}", self.idx)
 
     async def _var(self, parent, path, value, vtype, writable=False):
-        node = await parent.add_variable(self._nid(path), path.split(".")[-1], ua.Variant(value, vtype))
+        node = await parent.add_variable(self._nid(path), path.split(".")[-1], ua.Variant(_coerce(value, vtype), vtype))
         if writable:
             await node.set_writable()
         self.nodes[path] = (node, vtype)
@@ -93,178 +100,159 @@ class OpcUaServer:
         self.server.set_security_policy([ua.SecurityPolicyType.NoSecurity])
         self.idx = await self.server.register_namespace(c["namespace"])
 
-        objects = self.server.nodes.objects
-        root = await objects.add_object(ua.NodeId("VisionServer", self.idx), "VisionServer")
-        ctrl = await root.add_folder(self._nid("Control"), "Control")
+        root = await self.server.nodes.objects.add_object(ua.NodeId("VisionServer", self.idx), "VisionServer")
         status = await root.add_folder(self._nid("Status"), "Status")
-        res = await root.add_folder(self._nid("Result"), "Result")
-        self.tools_folder = await root.add_folder(self._nid("Tools"), "Tools")
-        safety = await root.add_folder(self._nid("Safety"), "Safety")
-        self.zones_folder = await safety.add_folder(self._nid("Safety.Zones"), "Zones")
-
-        rec = self.engine.recipe
-        await self._var(ctrl, "Control.Trigger", False, V.Boolean, writable=True)
-        await self._var(ctrl, "Control.ResetCounter", False, V.Boolean, writable=True)
-        await self._var(ctrl, "Control.RecipeNumber", int(rec["number"]), V.Int32, writable=True)
         await self._var(status, "Status.Heartbeat", 0, V.UInt32)
-        await self._var(status, "Status.InspectionRunning", self.engine.running, V.Boolean)
-        await self._var(status, "Status.Ready", self.engine.running, V.Boolean)
-        await self._var(status, "Status.Busy", False, V.Boolean)
-        await self._var(status, "Status.CameraOk", False, V.Boolean)
-        await self._var(status, "Status.Error", "", V.String)
-        await self._var(status, "Status.ActiveRecipeNumber", int(rec["number"]), V.Int32)
-        await self._var(status, "Status.ActiveRecipeName", rec["name"], V.String)
-        await self._var(res, "Result.Counter", 0, V.UInt32)
-        await self._var(res, "Result.Pass", False, V.Boolean)
-        await self._var(res, "Result.CycleTimeMs", 0.0, V.Double)
-        await self._var(res, "Result.Timestamp", "", V.String)
-        await self._var(safety, "Safety.Enabled", False, V.Boolean)
-        await self._var(safety, "Safety.Danger", False, V.Boolean)
-        await self._var(safety, "Safety.Warning", False, V.Boolean)
-        await self._var(safety, "Safety.PersonCount", 0, V.UInt32)
+        await self._var(status, "Status.CamerasOk", False, V.Boolean)
+        self.folders["Cameras"] = await root.add_folder(self._nid("Cameras"), "Cameras")
+        for m in self.hub.modules.values():
+            b = m.opc_folder
+            f = await root.add_folder(self._nid(b), b)
+            self.folders[m.name] = f
+            for name, vt, val in (("Enabled", V.Boolean, False), ("Alarm", V.Boolean, False),
+                                  ("Warning", V.Boolean, False), ("Level", V.Int32, 0),
+                                  ("AlarmText", V.String, ""), ("Error", V.String, ""),
+                                  ("ActiveRecipeName", V.String, m.recipe["name"])):
+                await self._var(f, f"{b}.{name}", val, vt)
+            await self._var(f, f"{b}.RecipeNumber", int(m.recipe["number"]), V.Int32, writable=True)
+            await self._var(f, f"{b}.ResetCounters", False, V.Boolean, writable=True)
+            for name, vt, _ in m.opc_summary:
+                await self._var(f, f"{b}.{name}", 0 if vt != "String" else "", getattr(V, vt))
+            self.folders[m.name + ".tools"] = await f.add_folder(self._nid(f"{b}.{m.opc_tools_folder}"),
+                                                                 m.opc_tools_folder)
         await self.rebuild()
-
         await self.server.start()
         self.running = True
         self._tasks = [asyncio.create_task(self._poll_control()), asyncio.create_task(self._heartbeat())]
-        self.engine.add_listener(self._on_result)
-        if self.safety:
-            self.safety.add_listener(self._on_safety)
+        for m in self.hub.modules.values():
+            m.add_listener(self._on_state)
         log.info("OPC UA escuchando en opc.tcp://<IP>:%s/visionserver/", c["port"])
 
-    # ---------- nodos dinámicos (herramientas de la receta activa y zonas) ----------
+    # ---------------------------------------------------------------- nodos dinámicos
     async def rebuild(self):
+        """Herramientas de la receta activa de cada bloque y cámaras."""
         async with self._build_lock:
-            for n in list(self.tool_nodes.values()) + list(self.zone_nodes.values()):
-                await self.server.delete_nodes([n["folder"]], recursive=True)
-            self.tool_nodes, self.zone_nodes = {}, {}
-            for t, name in _unique_names(self.engine.tools):
-                p = f"Tools.{name}"
-                folder = await self.tools_folder.add_folder(self._nid(p), name)
-                self.tool_nodes[t["id"]] = {
-                    "folder": folder,
-                    "value": await folder.add_variable(self._nid(f"{p}.Value"), "Value", ua.Variant(0.0, V.Double)),
-                    "pass": await folder.add_variable(self._nid(f"{p}.Pass"), "Pass", ua.Variant(False, V.Boolean)),
-                    "text": await folder.add_variable(self._nid(f"{p}.Text"), "Text", ua.Variant("", V.String)),
+            if self._dyn_folders:
+                await self.server.delete_nodes(self._dyn_folders, recursive=True)
+            self._dyn_folders, self.dyn, self.cam_nodes, self._last = [], {}, {}, {}
+            for cam, name in _unique_names(self.cfg["cameras"]):
+                p = f"Cameras.{name}"
+                f = await self.folders["Cameras"].add_folder(self._nid(p), name)
+                self._dyn_folders.append(f)
+                self.cam_nodes[cam["id"]] = {
+                    "ok": await f.add_variable(self._nid(f"{p}.Ok"), "Ok", ua.Variant(False, V.Boolean)),
+                    "fps": await f.add_variable(self._nid(f"{p}.Fps"), "Fps", ua.Variant(0.0, V.Double)),
                 }
-            for z, name in _unique_names(self.engine.cfg["safety"].get("zones", [])):
-                p = f"Safety.Zones.{name}"
-                folder = await self.zones_folder.add_folder(self._nid(p), name)
-                self.zone_nodes[z["id"]] = {
-                    "folder": folder,
-                    "occupied": await folder.add_variable(self._nid(f"{p}.Occupied"), "Occupied",
-                                                          ua.Variant(False, V.Boolean)),
-                    "count": await folder.add_variable(self._nid(f"{p}.Count"), "Count", ua.Variant(0, V.UInt32)),
-                }
-            rec = self.engine.recipe
-            await self._write("Status.ActiveRecipeNumber", int(rec["number"]))
-            await self._write("Status.ActiveRecipeName", rec["name"])
-            await self._write("Control.RecipeNumber", int(rec["number"]))
-            self._recipe_req = int(rec["number"])
+            for m in self.hub.modules.values():
+                tf = self.folders[m.name + ".tools"]
+                self.dyn[m.name] = {}
+                for t, name in _unique_names(m.recipe.get("tools", [])):
+                    p = f"{m.opc_folder}.{m.opc_tools_folder}.{name}"
+                    f = await tf.add_folder(self._nid(p), name)
+                    self._dyn_folders.append(f)
+                    fields = {}
+                    for fname, vt, _ in m.opc_tool_fields:
+                        vtype = getattr(V, vt)
+                        node = await f.add_variable(self._nid(f"{p}.{fname}"), fname,
+                                                    ua.Variant(_coerce(None, vtype), vtype))
+                        fields[fname] = (node, vtype)
+                    self.dyn[m.name][t["id"]] = fields
+                rec = m.recipe
+                await self._write(f"{m.opc_folder}.ActiveRecipeName", rec["name"])
+                await self._write(f"{m.opc_folder}.RecipeNumber", int(rec["number"]))
+                self._recipe_req[m.name] = int(rec["number"])
 
     async def rebuild_tools(self):
         if self.running:
             await self.rebuild()
 
-    @staticmethod
-    async def _set(node, value, vtype):
+    async def _set(self, node, value, vtype):
+        value = _coerce(value, vtype)
+        if self._last.get(node) == value:
+            return
+        self._last[node] = value
         await node.write_value(ua.DataValue(ua.Variant(value, vtype)))
 
     async def _write(self, path, value):
         node, vtype = self.nodes[path]
         await self._set(node, value, vtype)
 
-    # ---------- ciclo de control ----------
+    # ---------------------------------------------------------------- control desde el PLC
     async def _poll_control(self):
-        trig_node = self.nodes["Control.Trigger"][0]
-        reset_node = self.nodes["Control.ResetCounter"][0]
-        recipe_node = self.nodes["Control.RecipeNumber"][0]
         loop = asyncio.get_running_loop()
         while True:
-            try:
-                wanted = await recipe_node.read_value()
-                if wanted != self._recipe_req:  # solo cuando el PLC cambia el valor
-                    self._recipe_req = wanted
-                    if wanted != self.engine.recipe["number"]:
-                        r = await loop.run_in_executor(None, self.engine.select_recipe, wanted)
-                        if r is None:
-                            await self._write("Status.Error", f"Receta {wanted} no existe")
-                            await self._write("Control.RecipeNumber", int(self.engine.recipe["number"]))
-                            self._recipe_req = int(self.engine.recipe["number"])
-                        # si existe, el listener de receta (main.py) reconstruye los nodos
-                if await trig_node.read_value():
-                    await self._write("Status.Busy", True)
-                    await self._write("Status.Ready", False)
-                    r = await loop.run_in_executor(None, self.engine.inspect, "opcua")
-                    if r is None:
-                        await self._write("Status.Error", "Inspección detenida: presione Ejecutar")
-                    await self._write("Control.Trigger", False)  # acuse de recibo al PLC
-                    await self._write("Status.Busy", False)
-                    await self._write("Status.Ready", self.engine.running)
-                if await reset_node.read_value():
-                    self.engine.counter = 0
-                    await self._write("Result.Counter", 0)
-                    await self._write("Control.ResetCounter", False)
-            except Exception:
-                log.exception("Error en ciclo de control OPC UA")
-            await asyncio.sleep(0.02)
+            for m in self.hub.modules.values():
+                b = m.opc_folder
+                try:
+                    wanted = await self.nodes[f"{b}.RecipeNumber"][0].read_value()
+                    if wanted != self._recipe_req.get(m.name):  # solo cuando el PLC cambia el valor
+                        self._recipe_req[m.name] = wanted
+                        if wanted != m.recipe["number"]:
+                            r = await loop.run_in_executor(None, m.select_recipe, wanted)
+                            if r is None:
+                                await self._write(f"{b}.Error", f"Receta {wanted} no existe")
+                                self._last.pop(self.nodes[f"{b}.RecipeNumber"][0], None)
+                                await self._write(f"{b}.RecipeNumber", int(m.recipe["number"]))
+                                self._recipe_req[m.name] = int(m.recipe["number"])
+                            # si existe, el listener de receta (main.py) reconstruye los nodos
+                    reset_node = self.nodes[f"{b}.ResetCounters"][0]
+                    if await reset_node.read_value():
+                        m.reset_counters()
+                        await reset_node.write_value(ua.DataValue(ua.Variant(False, V.Boolean)))
+                except Exception:
+                    log.exception("Error en control OPC UA de %s", b)
+            await asyncio.sleep(0.1)
 
     async def _heartbeat(self):
         hb = 0
         while True:
-            hb = (hb + 1) % 2**32
+            hb = (hb + 1) % 2 ** 32
             try:
                 await self._write("Status.Heartbeat", hb)
-                await self._write("Status.InspectionRunning", self.engine.running)
-                if not self.engine.running:
-                    await self._write("Status.Ready", False)
-                cam_err = self.engine.camera.error
-                await self._write("Status.CameraOk", cam_err is None)
-                if cam_err:
-                    await self._write("Status.Error", cam_err)
+                st = self.hub.cameras.status()
+                await self._write("Status.CamerasOk", all(c["ok"] for c in st if c["enabled"]))
+                for c in st:
+                    n = self.cam_nodes.get(c["id"])
+                    if n:
+                        await self._set(n["ok"], c["ok"], V.Boolean)
+                        await self._set(n["fps"], c["fps"], V.Double)
             except Exception:
                 log.exception("Error en heartbeat")
             await asyncio.sleep(1)
 
-    # ---------- publicación ----------
-    def _on_result(self, result):
-        """Llamado desde el hilo de visión."""
+    # ---------------------------------------------------------------- publicación
+    def _on_state(self, module, state):
+        """Llamado desde el hilo del bloque."""
         if self._loop and self.running:
-            asyncio.run_coroutine_threadsafe(self._publish(result), self._loop)
+            asyncio.run_coroutine_threadsafe(self._publish(module, state), self._loop)
 
-    async def _publish(self, r):
-        await self._write("Result.Counter", r["counter"] % 2**32)
-        await self._write("Result.Pass", bool(r["pass"]))
-        await self._write("Result.CycleTimeMs", float(r["cycle_ms"]))
-        await self._write("Result.Timestamp", r["timestamp"])
-        await self._write("Status.Error", r.get("error") or "")
-        for tr in r["tools"]:
-            n = self.tool_nodes.get(tr["id"])
-            if n:
-                await self._set(n["value"], float(tr["value"]), V.Double)
-                await self._set(n["pass"], bool(tr["pass"]), V.Boolean)
-                await self._set(n["text"], tr.get("text", ""), V.String)
-
-    def _on_safety(self, state):
-        if self._loop and self.running:
-            asyncio.run_coroutine_threadsafe(self._publish_safety(state), self._loop)
-
-    async def _publish_safety(self, s):
-        await self._write("Safety.Enabled", bool(s["enabled"]))
-        await self._write("Safety.Danger", bool(s["danger"]))
-        await self._write("Safety.Warning", bool(s["warning"]))
-        await self._write("Safety.PersonCount", int(s["persons"]))
-        for z in s["zones"]:
-            n = self.zone_nodes.get(z["id"])
-            if n:
-                await self._set(n["occupied"], bool(z["occupied"]), V.Boolean)
-                await self._set(n["count"], int(z["count"]), V.UInt32)
+    async def _publish(self, m, s):
+        if self._build_lock.locked():
+            return
+        b = m.opc_folder
+        try:
+            await self._write(f"{b}.Enabled", s["running"])
+            await self._write(f"{b}.Alarm", s["alarm"])
+            await self._write(f"{b}.Warning", s["warning"])
+            await self._write(f"{b}.Level", LEVEL_NUM.get(s["level"], 0))
+            await self._write(f"{b}.AlarmText", s.get("text", ""))
+            await self._write(f"{b}.Error", s.get("error") or "")
+            for name, _, fn in m.opc_summary:
+                await self._write(f"{b}.{name}", fn(s))
+            nodes = self.dyn.get(m.name, {})
+            for t in s["tools"]:
+                fields = nodes.get(t["id"])
+                if fields:
+                    for fname, _, fn in m.opc_tool_fields:
+                        node, vtype = fields[fname]
+                        await self._set(node, fn(t), vtype)
+        except Exception:
+            log.exception("Error publicando %s en OPC UA", b)
 
     async def stop(self):
         self.running = False
-        self.engine.remove_listener(self._on_result)
-        if self.safety:
-            self.safety.remove_listener(self._on_safety)
+        for m in self.hub.modules.values():
+            m.remove_listener(self._on_state)
         for t in self._tasks:
             t.cancel()
         if self.server:

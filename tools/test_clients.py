@@ -1,6 +1,6 @@
 """Simula un PLC/SCADA: prueba el servidor TCP y el servidor OPC UA.
 
-Uso:  python tools/test_clients.py [IP]   (por defecto 127.0.0.1)
+Uso:  python tools/test_clients.py [IP] [puerto_tcp] [puerto_opcua]   (por defecto 127.0.0.1 5000 4841)
 """
 import asyncio
 import socket
@@ -9,42 +9,32 @@ import sys
 from asyncua import Client
 
 HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
+TCP_PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+OPC_PORT = int(sys.argv[3]) if len(sys.argv) > 3 else 4841
+BLOCKS = ("Safety", "PPE", "Andon", "Stock")
 
 
-def test_tcp(port=5000):
-    print(f"--- TCP {HOST}:{port}")
-    with socket.create_connection((HOST, port), timeout=5) as s:
+def test_tcp():
+    print(f"--- TCP {HOST}:{TCP_PORT}")
+    with socket.create_connection((HOST, TCP_PORT), timeout=5) as s:
         f = s.makefile("rwb")
-        for cmd in ["PING", "STATUS", "TRIGGER", "GET", "FOO"]:
+        for cmd in ["PING", "STATUS", "SAFETY", "EPP", "ANDON", "STOCK", "RECIPE STOCK", "FOO"]:
             f.write((cmd + "\r\n").encode())
             f.flush()
-            print(f"{cmd:8} -> {f.readline().decode().strip()}")
+            print(f"{cmd:13} -> {f.readline().decode().strip()}")
 
 
-async def test_opcua(port=4841):
-    url = f"opc.tcp://{HOST}:{port}/visionserver/"
+async def test_opcua():
+    url = f"opc.tcp://{HOST}:{OPC_PORT}/visionserver/"
     print(f"--- OPC UA {url}")
     async with Client(url) as c:
         idx = await c.get_namespace_index("urn:visionserver")
         node = lambda p: c.get_node(f"ns={idx};s=VisionServer.{p}")
-        before = await node("Result.Counter").read_value()
-        await node("Control.Trigger").write_value(True)  # disparo, como lo haría el PLC
-        for _ in range(100):
-            await asyncio.sleep(0.02)
-            if not await node("Control.Trigger").read_value():  # acuse del servidor
-                break
-        await asyncio.sleep(0.1)
-        print("Counter      :", before, "->", await node("Result.Counter").read_value())
-        print("Pass         :", await node("Result.Pass").read_value())
-        print("CycleTimeMs  :", await node("Result.CycleTimeMs").read_value())
-        print("Heartbeat    :", await node("Status.Heartbeat").read_value())
-        print("CameraOk     :", await node("Status.CameraOk").read_value())
-        tools = await node("Tools").get_children()
-        for t in tools:
-            name = (await t.read_browse_name()).Name
-            val = await c.get_node(f"ns={idx};s=VisionServer.Tools.{name}.Value").read_value()
-            ok = await c.get_node(f"ns={idx};s=VisionServer.Tools.{name}.Pass").read_value()
-            print(f"Tools.{name:8}: {val}  pass={ok}")
+        print("Heartbeat :", await node("Status.Heartbeat").read_value())
+        print("CamerasOk :", await node("Status.CamerasOk").read_value())
+        for b in BLOCKS:
+            vals = [await node(f"{b}.{n}").read_value() for n in ("Enabled", "Alarm", "Warning", "AlarmText")]
+            print(f"{b:7} Enabled={vals[0]} Alarm={vals[1]} Warning={vals[2]} Texto={vals[3]!r}")
 
 
 if __name__ == "__main__":

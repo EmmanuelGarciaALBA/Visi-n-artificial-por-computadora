@@ -1,7 +1,11 @@
 .venv/
+.venv_*/
 __pycache__/
 logs/
+respaldo/
 *.tmp
+# Datos de cada instalación: contraseñas de cámara y correo, usuarios y clave de sesión
+config.json
 users.json
 secret.key
 models/
